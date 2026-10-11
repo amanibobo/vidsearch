@@ -1,0 +1,15 @@
+numpy
+pillow
+scenedetect
+opencv-python-headless
+httpx
+anthropic       # only for claude-* caption models
+fastapi
+uvicorn
+PyJWT[crypto]   # Auth0 access tokens
+# models (install torch for your platform first: https://pytorch.org/get-started/locally/)
+torch
+open_clip_torch>=2.31
+sentence-transformers
+# tests
+pytest
