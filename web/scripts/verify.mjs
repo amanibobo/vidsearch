@@ -2,9 +2,10 @@
 // failing and cold API; atlas progress), atlas pixel checks on plane slices and lifted cards, hover-card placement, frame
 // still and video seek, search states and retries, camera travel, fps, and the overview at a 3-film library. Then
 // uploads, in whichever mode the API advertises: quota, client-side refusals, a chunked upload with an injected part
-// failure, job stages, the new private strip and camera move, search and privacy across identities, URL errors, delete.
-// Device mode (VS_ANON_UPLOADS=1, no auth env on the dev server) adds the browser-identity corner, cancel giving the slot
-// back and the per-IP cap; account mode (VS_DEV_AUTH=1 and VITE_DEV_AUTH=tester) adds sign-in and expired sessions.
+// failure, job stages and overall progress, the new private strip and camera moves, search and privacy across
+// identities, URL errors, the panel's tabs and motion (and reduced motion), my uploads rows, delete, the empty state.
+// Device mode (VS_ANON_UPLOADS=1, no auth env on the dev server) adds the browser-identity corner, running and failed
+// rows, cancel giving the slot back and the per-IP cap; account mode (VS_DEV_AUTH=1 and VITE_DEV_AUTH=tester) adds sign-in and expired sessions.
 // Usage: node scripts/verify.mjs <outDir> <label>   (env BASE_URL, default http://localhost:5199; CHROMIUM to override the binary;
 // ONLY=archive or ONLY=uploads runs one half; ONLY=prod checks a production build served by `vite preview` instead).
 // The upload half makes its 30 s clip from ../videos/Cops.mp4 with ffmpeg and fills the API's per-IP quota, so give it
@@ -71,6 +72,20 @@ function findChromium() {
 const failures = []
 const check = (ok, msg) => { console.log(`${ok ? 'PASS' : 'FAIL'} ${msg}`); if (!ok) failures.push(msg) }
 const shot = (page, name) => page.screenshot({ path: join(outDir, `${label}-${name}.png`) })
+/** The full 1920x1080 view, plus the top-right corner (chip, links, panel) at 2x for reading the panel's details. */
+async function shots(page, name) {
+  await page.waitForTimeout(300)  // let the panel's fade, row hover and tab fade finish
+  await shot(page, name)
+  const panel = await page.evaluate(() => { const r = document.querySelector('.panel')?.getBoundingClientRect(); return r && { left: r.left, bottom: r.bottom } })
+  const left = Math.max(0, (panel?.left ?? VIEWPORT.width - 460) - 40)
+  const clip = { x: left, y: 0, width: VIEWPORT.width - left, height: Math.min(VIEWPORT.height, (panel?.bottom ?? 80) + 40) }
+  const cdp = await page.context().newCDPSession(page)
+  const { data } = await cdp.send('Page.captureScreenshot', { format: 'png', clip: { ...clip, scale: 2 } })
+  await cdp.detach()
+  writeFileSync(join(outDir, `${label}-${name}-panel2x.png`), Buffer.from(data, 'base64'))
+}
+const METER = '.panel-head .quota-meter'
+const quotaOf = (page) => page.$eval(METER, (m) => ({ label: m.getAttribute('aria-label'), dots: m.querySelectorAll('i').length, used: m.querySelectorAll('i[data-used]').length }))
 const clock = (s) => {
   const tenths = Math.max(0, Math.round(s * 10)), r = tenths % 600
   return `${Math.floor(tenths / 600)}:${String(Math.floor(r / 10)).padStart(2, '0')}.${r % 10}`
@@ -137,7 +152,7 @@ function atlasVerdict(what, frame, { diffs, composite }, file) {
 
 /** Mean luminance and count of lilac pixels inside a rectangle of a screenshot. */
 async function tone(page, rect) {
-  const png = await page.screenshot({ clip: rect })
+  const png = await page.screenshot({ clip: rect, scale: 'css' })
   return page.evaluate(async (b64) => {
     const img = await new Promise((ok) => { const i = new Image(); i.onload = () => ok(i); i.src = `data:image/png;base64,${b64}` })
     const c = document.createElement('canvas'); c.width = img.naturalWidth; c.height = img.naturalHeight
@@ -560,8 +575,8 @@ async function uploadChecks() {
 }
 
 /** A fresh browser profile on the loaded archive. `devUser` picks the dev-auth user ('' = signed out). */
-async function openPage(contexts, name, { devUser, prepare } = {}) {
-  const ctx = await browser.newContext({ viewport: VIEWPORT })
+async function openPage(contexts, name, { devUser, prepare, reducedMotion } = {}) {
+  const ctx = await browser.newContext({ viewport: VIEWPORT, reducedMotion })
   contexts.push(ctx)
   if (devUser !== undefined) await ctx.addInitScript((u) => localStorage.setItem('vidsearch.dev-user', u), devUser)
   const page = await ctx.newPage()
@@ -604,14 +619,16 @@ async function deviceToken(page) {
 /**
  * The upload journey both modes share, for the identity `me` ({ bearer, openPanel(page, 'upload' | 'my uploads'), note,
  * afterUpload?(page, filmId) }) on `page`, whose upload panel is already open on a fresh quota. `openOther()` returns
- * another identity's page and bearer, opened after the film exists. Returns the film id, deleted again by the end.
+ * another identity's page (reduced motion) and bearer, opened after the film exists. Returns the film id, deleted again by the end.
  */
 async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
   const clipBytes = statSync(clip).size
-  await page.waitForSelector('.quota:text-matches("of 3")')
-  const quota0 = await page.textContent('.quota')
-  check(quota0 === '3 of 3 uploads left today', `upload panel shows "${quota0}"`)
-  await shot(page, '2-upload-panel')
+  await page.waitForSelector(`${METER}[aria-label$="left today"]`)
+  const quota0 = await quotaOf(page)
+  check(quota0.label === '3 of 3 uploads left today' && quota0.dots === 3 && quota0.used === 0, `the panel head's quota meter: "${quota0.label}", ${quota0.used} of ${quota0.dots} dots filled`)
+  check(await page.getAttribute('input[name=title]', 'placeholder') === 'defaults to the file name' && await page.isDisabled('.upload-submit'),
+    'with no source chosen the title says it defaults to the file name and upload is disabled')
+  await shots(page, '1-upload-tab')
 
   let startCalls = 0
   page.on('request', (r) => { if (r.method() === 'POST' && new URL(r.url()).pathname === '/api/uploads') startCalls++ })
@@ -632,19 +649,34 @@ async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
     await r.continue().catch(() => {})
   })
   await page.setInputFiles('.drop input[type=file]', clip)
-  const autoTitle = await page.inputValue('input[name=title]')
-  check(autoTitle === 'upload-clip' && !(await page.$('.upload-error')) && !(await page.isDisabled('.upload-submit')), `choosing the clip clears the refusal and titles it from the file name ("${autoTitle}")`)
+  const autoTitle = { value: await page.inputValue('input[name=title]'), placeholder: await page.getAttribute('input[name=title]', 'placeholder') }
+  check(autoTitle.value === '' && autoTitle.placeholder === 'upload-clip' && !(await page.$('.upload-error')) && !(await page.isDisabled('.upload-submit')),
+    `choosing the clip clears the refusal, enables upload and offers its file name as the default title ("${autoTitle.placeholder}")`)
   const title = `Cops clip ${run}`
   await page.fill('input[name=title]', title)
   const viewBefore = await page.evaluate(() => window.__vidsearch.view())
+  await page.evaluate(() => {
+    window.__progress = []
+    window.__progressTimer = setInterval(() => {
+      const bar = document.querySelector('.journey .bar')?.getAttribute('aria-valuenow')
+      const chip = document.querySelector('.chip .percent')?.textContent
+      window.__progress.push({ t: Math.round(performance.now()), bar: bar == null ? null : +bar, chip: chip ? parseInt(chip, 10) : null })
+    }, 100)
+  })
   await page.click('.upload-submit')
-  await page.waitForSelector('.transfer-bar')
-  await page.waitForFunction(() => /^[1-9][\d.]* MB of/.test(document.querySelector('.transfer-bytes')?.textContent ?? ''), null, { timeout: 15000 }).catch(() => {})
+  await page.waitForSelector('.journey .bar')
+  const current = '.stages li[data-state=current]'
+  await page.waitForFunction((sel) => /^[1-9][\d.]* MB of/.test(document.querySelector(`${sel} .stage-count`)?.textContent ?? ''), current, { timeout: 15000 }).catch(() => {})
   await page.waitForTimeout(300)
-  const sending = { bytes: await page.textContent('.transfer-bytes').catch(() => null), chip: await page.textContent('.chip-text').catch(() => null) }
-  await shot(page, '3-uploading')
-  check((sending.bytes ?? '').includes(` of ${(clipBytes / 1024 ** 2).toFixed(1)} MB`) && /^uploading \d+%$/.test(sending.chip ?? ''), `while sending: "${sending.bytes}", chip "${sending.chip}"`)
-  await page.waitForSelector('.stages', { timeout: 60000 })
+  const sending = {
+    step: await page.textContent(`${current} .stage-name`).catch(() => null),
+    bytes: await page.textContent(`${current} .stage-count`).catch(() => null),
+    chip: await page.textContent('.chip-text').catch(() => null),
+  }
+  await shots(page, '2-uploading')
+  check(sending.step === 'uploading' && (sending.bytes ?? '').includes(` of ${(clipBytes / 1024 ** 2).toFixed(1)} MB`) && /^uploading \d+%$/.test(sending.chip ?? ''),
+    `while sending, the "${sending.step}" step reads "${sending.bytes}", chip "${sending.chip}"`)
+  await page.waitForFunction(() => document.querySelector('.stages li')?.dataset.state === 'done' || !!document.querySelector('.journey-done'), null, { timeout: 60000 })
   check(JSON.stringify(parts) === JSON.stringify({ 0: 1, 1: 2, 2: 1 }) && peak === 3,
     `three 8 MiB parts of ${clipBytes} bytes sent 3 at a time (peak ${peak}); part 1 failed once with 500 and was retried (${JSON.stringify(parts)})`)
   await page.unroute('**/api/uploads/*/parts/*')
@@ -654,54 +686,88 @@ async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
   const chipClosed = await page.textContent('.chip-text').catch(() => null)
   check(!!chipClosed && !(await page.$('.panel')), `with the panel closed the job keeps running behind a chip: "${chipClosed}"`)
   await page.click('.chip')
-  await page.waitForSelector('.panel.upload .stages')
+  await page.waitForSelector('.panel.upload .journey')
 
   const seen = new Set()
-  let shotTaken = false, shotAtProgress = false
+  let shotTaken = false, shotAtProgress = false, marks = null
   const deadline = Date.now() + 10 * 60_000
-  while (Date.now() < deadline && !(await page.$('.job-done, .panel.upload .upload-error'))) {
-    const cur = await page.$eval('.stages li[data-state=current]', (li) => ({ name: li.querySelector('.stage-name').textContent, count: li.querySelector('.stage-count')?.textContent ?? null })).catch(() => null)
-    if (cur) {
-      seen.add(cur.name)
-      if (cur.count && !shotAtProgress && (!shotTaken || !cur.count.startsWith('0 '))) {
-        await shot(page, '4-processing')
+  while (Date.now() < deadline && !(await page.$('.journey-done, .panel.upload .upload-error'))) {
+    const cur = await page.$$eval('.stages li', (lis) => lis.map((li) => ({
+      name: li.querySelector('.stage-name').textContent, state: li.dataset.state, count: li.querySelector('.stage-count')?.textContent ?? null,
+      check: !!li.querySelector('.check'), spinner: !!li.querySelector('.spinner'),
+    }))).catch(() => [])
+    const at = cur.find((s) => s.state === 'current')
+    if (at) {
+      seen.add(at.name)
+      if (!marks && cur.some((s) => s.state === 'done') && cur.some((s) => s.state === 'todo')) marks = cur
+      if (at.count && !shotAtProgress && (!shotTaken || !at.count.startsWith('0 '))) {
+        await shots(page, '3-processing')
         shotTaken = true
-        shotAtProgress = !cur.count.startsWith('0 ')
-        console.log(`processing shot at ${cur.name} ${cur.count}`)
+        shotAtProgress = !at.count.startsWith('0 ')
+        console.log(`processing shot at ${at.name} ${at.count}`)
       }
     }
     await page.waitForTimeout(250)
   }
-  if (!shotTaken) await shot(page, '4-processing')
+  if (!shotTaken) await shots(page, '3-processing')
+  await page.waitForTimeout(400)
+  const progress = await page.evaluate(() => { clearInterval(window.__progressTimer); return window.__progress })
+  const dwell = progress.filter((p) => p.bar !== null).reduce((m, p, i, a) => (i && a[i - 1].bar === p.bar ? m : [...m, { bar: p.bar, t: p.t }]), [])
+  console.log(`bar values over time: ${dwell.map((d, i) => `${d.bar}@${((d.t - dwell[0].t) / 1000).toFixed(1)}s`).join(' ')}`)
+  const bars = progress.map((p) => p.bar).filter((v) => v !== null)
+  const chips = progress.map((p) => p.chip).filter((v) => v !== null)
+  const backwards = (xs) => xs.filter((v, i) => i > 0 && v < xs[i - 1]).length
+  const regressions = progress.flatMap((p, i) => (i && p.chip !== null && progress[i - 1].chip !== null && p.chip < progress[i - 1].chip ? [`${progress[i - 1].chip}->${p.chip}@${p.t - progress[0].t}ms`] : []))
+  if (regressions.length) console.log(`chip went back: ${regressions.join(', ')}; samples ${JSON.stringify(progress.map((p) => [p.t - progress[0].t, p.bar, p.chip]))}`)
+  const distinct = (xs) => [...new Set(xs)]
+  console.log(`overall progress over ${progress.length} samples: bar ${distinct(bars).join(' ')} | chip ${distinct(chips).join(' ')}`)
+  check(bars.length > 20 && backwards(bars) === 0 && bars.at(-1) === 100 && distinct(bars).length >= 4 && backwards(chips) === 0 && distinct(chips).length >= 4,
+    `overall progress only moves forward through the whole upload: bar ${bars[0]} -> ${bars.at(-1)} over ${distinct(bars).length} values, chip ${chips[0]}% -> ${chips.at(-1)}% (${backwards(bars)} + ${backwards(chips)} steps back)`)
+  const marksOk = !!marks && marks.every((s) => (s.state === 'done' ? s.check && !s.spinner : s.state === 'current' ? s.spinner && !s.check : !s.check && !s.spinner))
+  check(marksOk && marks.some((s) => s.state === 'done') && marks.some((s) => s.state === 'todo'),
+    `while processing, done steps carry a check, the current one a spinner, upcoming ones neither (${marks?.map((s) => `${s.name}:${s.state}`).join(', ')})`)
   const doneText = await page.textContent('.job-done').catch(() => null)
-  const finalStages = await page.$$eval('.stages li', (lis) => lis.map((li) => `${li.querySelector('.stage-name').textContent}:${li.dataset.state}`))
   console.log('stages seen while polling:', [...seen].join(' → '))
   // A warm model embeds a 30 s clip between two 1.5 s polls, so which stages the panel catches live varies.
-  check(!!doneText && finalStages.every((s) => s.endsWith(':done')) && seen.size >= 2,
-    `the job's stages advance live (${seen.size} seen) to done: "${doneText}" (${finalStages.join(', ')})`)
+  check(doneText === 'in the archive' && !(await page.$('.panel.upload .stages')) && await page.isVisible('.journey-done button:text-is("view in archive")') && seen.size >= 2,
+    `the job's stages advance live (${seen.size} seen), then collapse to one line: "${doneText}" with "view in archive"`)
   check(!(await page.$('.chip')), 'the status chip goes away once nothing is running')
 
   const jobs = (await apiAs(page, me.bearer, '/api/jobs')).body
   const job = jobs.jobs.find((j) => j.title === title)
   const filmId = job?.film_id
   await page.waitForFunction((id) => !!window.__vidsearch.ownerMark(id), filmId, { timeout: 15000 }).catch(() => {})
-  await page.click('.panel-close')
-  await page.waitForTimeout(100)
   await page.waitForFunction(() => window.__vidsearch.settled(), null, { timeout: 15000 })
-  await page.waitForTimeout(600)
-  const viewAfter = await page.evaluate(() => window.__vidsearch.view())
+  const viewDone = await page.evaluate(() => window.__vidsearch.view())
+  check(viewDone.dist < viewBefore.dist * 0.6, `when the job is done the camera eases toward the new strip on its own (dist ${viewBefore.dist.toFixed(1)} -> ${viewDone.dist.toFixed(1)})`)
+  await shots(page, '4-done')
+
+  const toStrip = async (what, click) => {
+    await page.evaluate(() => window.__vidsearch.showOverview())
+    await page.waitForTimeout(100)
+    await page.waitForFunction(() => window.__vidsearch.settled(), null, { timeout: 15000 })
+    const before = await page.evaluate(() => window.__vidsearch.view())
+    await click()
+    const closing = !!(await page.$('.panel.closing'))
+    await page.waitForSelector('.panel', { state: 'detached', timeout: 2000 })
+    await page.waitForTimeout(100)
+    await page.waitForFunction(() => window.__vidsearch.settled(), null, { timeout: 15000 })
+    await page.waitForTimeout(400)
+    const after = await page.evaluate(() => window.__vidsearch.view())
+    const mid = await page.evaluate(([id, n]) => window.__vidsearch.screenOf(id, Math.floor(n / 2)), [filmId, 30])
+    check(closing && after.dist < before.dist * 0.6 && !!mid && Math.abs(mid.x - VIEWPORT.width / 2) < 120 && Math.abs(mid.y - VIEWPORT.height / 2) < 160,
+      `${what} fades the panel out and eases the camera to the strip (dist ${before.dist.toFixed(1)} -> ${after.dist.toFixed(1)}; strip middle at ${mid && `${mid.x.toFixed(0)},${mid.y.toFixed(0)}`})`)
+  }
+  await toStrip('"view in archive"', () => page.click('.journey-done button:text-is("view in archive")'))
   const mark = await page.evaluate((id) => window.__vidsearch.ownerMark(id), filmId)
   const markTone = mark && await tone(page, { x: mark.left, y: mark.top, width: Math.max(2, mark.right - mark.left), height: Math.max(2, mark.bottom - mark.top) })
-  const stripMid = await page.evaluate(([id, n]) => window.__vidsearch.screenOf(id, Math.floor(n / 2)), [filmId, 30])
-  await shot(page, '5-new-strip')
+  await shots(page, 'new-strip')
   const lib = (await apiAs(page, me.bearer, '/api/library')).body.films
   const mine = lib.find((f) => f.id === filmId)
   check(!!mine?.owner_is_you && lib.filter((f) => f.owner_is_you).length === 1, `the new film ${filmId} is in ${me.bearer}'s library, marked owner_is_you`)
   check(!!mark && markTone.lilac > 0.5 * (mark.right - mark.left) * (mark.bottom - mark.top), `its strip carries the lilac ownership mark (${markTone?.lilac} lilac px in ${JSON.stringify(mark && { w: Math.round(mark.right - mark.left), h: Math.round(mark.bottom - mark.top) })})`)
   const others = await page.evaluate((ids) => ids.map((id) => window.__vidsearch.ownerMark(id)), lib.filter((f) => !f.owner_is_you).map((f) => f.id))
   check(others.every((m) => m === null), 'public films carry no ownership mark')
-  check(viewAfter.dist < viewBefore.dist * 0.6 && !!stripMid && Math.abs(stripMid.x - VIEWPORT.width / 2) < 120 && Math.abs(stripMid.y - VIEWPORT.height / 2) < 160,
-    `the camera eased to the new strip (dist ${viewBefore.dist.toFixed(1)} -> ${viewAfter.dist.toFixed(1)}; strip middle on screen at ${stripMid && `${stripMid.x.toFixed(0)},${stripMid.y.toFixed(0)}`})`)
 
   const probe = (await apiAs(page, me.bearer, `/api/search?q=${encodeURIComponent('a man')}&k=3&films=${filmId}`)).body.results
   const query = probe[0]?.caption ?? 'a man'
@@ -721,11 +787,21 @@ async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
     `another identity (${other.bearer}) and anonymous visitors don't get the film in the library or on the plane`)
   check(found2.auth === `Bearer ${other.bearer}` && found2.body.results.length > 0 && !found2.body.results.some((r) => r.film_id === filmId) && found2.body.heatmap.films[filmId] === undefined && job2.status === 403,
     `another identity's search for the same words returns ${found2.body.results.length} public results and none from the upload; its job is 403 to them`)
+  await me.openPanel(other.page, 'my uploads')
+  const still = await other.page.evaluate(() => {
+    const p = document.querySelector('.panel')
+    return { animations: p.getAnimations().length, name: getComputedStyle(p).animationName }
+  })
+  await other.page.click('.panel-close')
+  const goneAtOnce = !(await other.page.$('.panel'))
+  check(still.animations === 0 && still.name === 'none' && goneAtOnce, `with prefers-reduced-motion the panel opens and closes without animating (${JSON.stringify(still)}, gone at once: ${goneAtOnce})`)
 
   await page.fill(INPUT, '')
   await page.press(INPUT, 'Enter')
   await me.openPanel(page, 'upload')
-  await clickIfShown(page, '.upload-submit:text-is("upload another")')  // after a reload the panel opens on the form
+  const opening = await page.evaluate(() => document.querySelector('.panel').getAnimations().map((a) => a.animationName))
+  check(opening.includes('panel-in'), `opening the panel plays its fade-and-rise (${JSON.stringify(opening)})`)
+  await clickIfShown(page, 'button:text-is("upload another")')  // after a reload the panel opens on the form
   await page.fill('input[name=url]', 'not a link')
   await page.fill('input[name=title]', 'bad link')
   await page.click('.upload-submit')
@@ -733,24 +809,77 @@ async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
   const urlError = await page.textContent('.panel.upload .upload-error')
   check(urlError === 'url must be an http(s) link to a video file', `a URL upload of a non-http string shows the API's error: "${urlError}"`)
   await page.click('.upload-submit:text-is("try again")')
-  const quota1 = await page.textContent('.quota')
-  check(quota1 === '2 of 3 uploads left today', `the remaining count follows /api/jobs: "${quota1}"`)
+  await page.waitForSelector(`${METER}[aria-label^="2 of 3"]`, { timeout: 5000 }).catch(() => {})
+  const quota1 = await quotaOf(page)
+  check(quota1.label === '2 of 3 uploads left today' && quota1.used === 1, `the meter follows /api/jobs: "${quota1.label}", ${quota1.used} dot filled`)
 
-  await me.openPanel(page, 'my uploads')
+  const box = () => page.evaluate(() => { const r = document.querySelector('.panel').getBoundingClientRect(); return { top: r.top, left: r.left, right: r.right } })
+  await page.waitForTimeout(600)
+  const boxUpload = await box()
+  const heights = page.evaluate(() => new Promise((done) => {
+    const hs = []
+    const tick = () => { hs.push(document.querySelector('.panel-body').getBoundingClientRect().height); if (hs.length < 40) requestAnimationFrame(tick); else done(hs) }
+    requestAnimationFrame(tick)
+  }))
+  await page.click('.tab:text-is("my uploads")')
+  const hs = await heights
+  const boxMine = await box()
+  const [h0, h1] = [hs[0], hs.at(-1)]
+  const between = hs.filter((h) => h < Math.max(h0, h1) - 2 && h > Math.min(h0, h1) + 2).length
+  check(Math.abs(boxUpload.top - boxMine.top) < 0.5 && Math.abs(boxUpload.left - boxMine.left) < 0.5 && Math.abs(boxUpload.right - boxMine.right) < 0.5,
+    `switching tabs keeps the panel in place (top/left ${boxUpload.top.toFixed(1)},${boxUpload.left.toFixed(1)} -> ${boxMine.top.toFixed(1)},${boxMine.left.toFixed(1)})`)
+  check(Math.abs(h0 - h1) > 40 && between >= 3, `and eases its height (${h0.toFixed(0)} -> ${h1.toFixed(0)} px through ${between} frames in between)`)
+
   const row = `.mine-list li[data-film="${filmId}"]`
   await page.waitForSelector(row)
-  const rowText = { title: await page.textContent(`${row} .mine-title`), meta: await page.textContent(`${row} .mine-meta`) }
-  check(rowText.title === title && /^ready · /.test(rowText.meta), `my uploads lists "${rowText.title}" as "${rowText.meta}"`)
-  const note = await page.textContent('.panel.mine .mine-note').catch(() => null)
-  check(note === me.note, `my uploads ${me.note ? `notes "${note}"` : 'has no browser note'}`)
-  await shot(page, '6-my-uploads')
-  await page.click(`${row} .mine-delete`)
-  await page.click(`${row} .danger`)
-  await page.waitForSelector(`${row} .mine-meta:text-matches("^deleted")`, { timeout: 15000 })
+  await page.waitForSelector(`${row} .thumb img[data-loaded]`, { timeout: 10000 }).catch(() => {})
+  const film = lib.find((f) => f.id === filmId)
+  const runtime = `${Math.floor(Math.round(film.duration) / 60)}:${String(Math.round(film.duration) % 60).padStart(2, '0')}`
+  const rowInfo = await page.$eval(row, (li) => {
+    const img = li.querySelector('.thumb img')
+    return { title: li.querySelector('.row-title').textContent, meta: li.querySelector('.row-meta').textContent, thumb: img && { w: img.naturalWidth, src: new URL(img.src).pathname, done: img.complete } }
+  })
+  check(rowInfo.title === title && rowInfo.meta.startsWith(`${runtime} · `) && /· (just now|\d+ min ago)$/.test(rowInfo.meta),
+    `my uploads lists "${rowInfo.title}" with its duration and a relative time: "${rowInfo.meta}"`)
+  check(!!rowInfo.thumb?.done && rowInfo.thumb.w > 0 && rowInfo.thumb.src.startsWith(`/media/${filmId}/frames/`), `its thumbnail is a frame still that loaded (${rowInfo.thumb?.src}, naturalWidth ${rowInfo.thumb?.w})`)
+  const foot = await page.$eval('.panel', (p) => { const n = p.querySelector('.panel-foot .browser-note'); return n && { text: n.textContent, title: n.getAttribute('title') } })
+  check(me.note ? foot?.text === 'saved to this browser' && foot.title === me.note : foot === null,
+    me.note ? `the footer says "${foot?.text}" with the full note in its tooltip ("${foot?.title}")` : 'account mode has no browser note')
+  const caps = await page.evaluate(() => [...document.querySelectorAll('.panel *, .masthead *, .account-bar *')]
+    .filter((el) => { const s = getComputedStyle(el); return s.textTransform === 'uppercase' || s.fontVariantCaps !== 'normal' }).map((el) => el.className))
+  check(caps.length === 0, `no text in the masthead, corner or panel is set in capitals (${JSON.stringify(caps)})`)
+  await page.hover(row)
+  await shots(page, '5-my-uploads')
+
+  await toStrip('clicking the ready row', () => page.click(`${row} .row-open`))
+
+  await me.openPanel(page, 'my uploads')
+  let deletes = 0
+  const onDelete = (r) => { if (r.method() === 'DELETE' && new URL(r.url()).pathname.startsWith('/api/films/')) deletes++ }
+  page.on('request', onDelete)
+  await page.hover(row)
+  await page.click(`${row} .row-delete`)
+  const confirm = await page.textContent(`${row} .row-confirm`)
+  await page.click(`${row} .confirm-no`)
+  const kept = !!(await page.$(`${row} .row-delete`)) && deletes === 0
+  await page.hover(row)
+  await page.click(`${row} .row-delete`)
+  await page.click(`${row} .confirm-yes`)
+  const leaving = await page.waitForSelector(`${row}[data-leaving]`, { timeout: 10000 }).then(() => true, () => false)
+  await page.waitForSelector(row, { state: 'detached', timeout: 10000 })
+  page.off('request', onDelete)
+  check(confirm === 'delete?yes·no' && kept, `delete asks inline first ("${confirm}": "delete?", "yes", "·", "no"); "no" keeps the row and sends nothing`)
   await page.waitForFunction((id) => !window.__vidsearch.screenOf(id, 0), filmId, { timeout: 15000 }).catch(() => {})
   const libAfter = (await apiAs(page, me.bearer, '/api/library')).body.films
-  check(!libAfter.some((f) => f.id === filmId) && !(await page.evaluate((id) => window.__vidsearch.screenOf(id, 0), filmId)) && !(await page.$(`${row} .mine-delete`)),
-    'delete (after confirming) removes the film from the API library and its strip from the plane')
+  check(leaving && deletes === 1 && !libAfter.some((f) => f.id === filmId) && !(await page.evaluate((id) => window.__vidsearch.screenOf(id, 0), filmId)),
+    'confirming deletes the film from the API library and its strip from the plane, and the row collapses away')
+
+  await page.waitForSelector('.mine-empty', { timeout: 10000 }).catch(() => {})
+  const empty = await page.textContent('.mine-empty p').catch(() => null)
+  await shots(page, '6-empty')
+  await page.click('.mine-empty button')
+  const switched = await page.$eval('.tab[aria-selected=true]', (t) => t.textContent).catch(() => null)
+  check(empty === 'nothing uploaded yet' && switched === 'upload' && !!(await page.$('.panel.upload .upload-form')), `the empty list says "${empty}" and its button switches to the ${switched} tab`)
   return filmId
 }
 
@@ -779,7 +908,7 @@ async function accountChecks() {
   check(JSON.stringify(items) === JSON.stringify(['upload', 'my uploads', 'sign out']), `signed in: the avatar menu lists ${JSON.stringify(items)}`)
   await menu(page, 'upload')
   await uploadJourney(page, { bearer: `dev:${me}`, openPanel: menu, note: null },
-    async () => ({ page: await openPage(contexts, other, { devUser: other }), bearer: `dev:${other}` }), fixtures)
+    async () => ({ page: await openPage(contexts, other, { devUser: other, reducedMotion: 'reduce' }), bearer: `dev:${other}` }), fixtures)
 
   let jobsCalls = 0
   const expired = await openPage(contexts, 'expired', { devUser: me, prepare: (p) => p.route('**/api/jobs', (r) => { if (r.request().headers().authorization) jobsCalls++; return r.fulfill({ status: 401, json: { detail: 'invalid token: expired' } }) }) })
@@ -814,10 +943,10 @@ async function deviceChecks() {
   check(DEVICE_TOKEN.test(bearer ?? '') && sent === `Bearer ${bearer}`, `opening upload mints this browser's id and sends it: ${sent}`)
 
   const openOther = async () => {
-    const other = await openPage(contexts, 'browser B')
+    const other = await openPage(contexts, 'browser B', { reducedMotion: 'reduce' })
     await corner(other, 'my uploads')
-    await other.waitForSelector('.panel.mine .job-note:text-is("nothing uploaded yet")', { timeout: 10000 }).catch(() => {})
-    const empty = await other.textContent('.panel.mine .job-note').catch(() => null)
+    await other.waitForSelector('.panel.mine .mine-empty', { timeout: 10000 }).catch(() => {})
+    const empty = await other.textContent('.panel.mine .mine-empty p').catch(() => null)
     const otherBearer = await deviceToken(other)
     check(DEVICE_TOKEN.test(otherBearer ?? '') && otherBearer !== bearer && empty === 'nothing uploaded yet',
       `a second browser (fresh storage) gets its own id and an empty "my uploads": "${empty}"`)
@@ -843,26 +972,53 @@ async function deviceChecks() {
   const used = async () => (await apiAs(page, bearer, '/api/jobs')).body.uploads_today
   await openPanel(page, 'upload')
   await clickIfShown(page, '.upload-submit:text-is("try again")')
-  await page.waitForSelector('.quota:text-matches("of 3")')
-  const quotaBefore = await page.textContent('.quota')
+  await page.waitForSelector(`${METER}[aria-label$="left today"]`)
+  const quotaBefore = (await quotaOf(page)).label
   await page.route('**/api/uploads/*/parts/*', () => {})  // parts hang until the cancel aborts them
   await page.setInputFiles('.drop input[type=file]', fixtures.clip)
   await page.fill('input[name=title]', `cancel me ${run}`)
   await page.click('.upload-submit')
-  await page.waitForSelector('.transfer-cancel')
+  await page.waitForSelector('.journey-cancel')
   await page.waitForTimeout(500)
   const usedDuring = await used()
   await shot(page, '7-cancelling')
-  await page.click('.transfer-cancel')
+  await page.click('.tab:text-is("my uploads")')
+  const activeRow = await page.waitForSelector('.mine-list li:first-child[data-kind=active]', { timeout: 5000 })
+    .then((li) => li.evaluate((el) => ({ title: el.querySelector('.row-title').textContent, meta: el.querySelector('.row-meta').textContent, bar: el.querySelector('.bar')?.getAttribute('aria-valuenow') })), () => null)
+  check(activeRow?.title === `cancel me ${run}` && activeRow.meta === 'uploading' && activeRow.bar !== undefined && activeRow.bar !== null,
+    `a running upload sits at the top of my uploads with its step and a progress bar (${JSON.stringify(activeRow)})`)
+  await page.click('.tab:text-is("upload")')
+  await page.click('.journey-cancel')
   await page.waitForSelector('.panel.upload .upload-error:text-is("upload cancelled")', { timeout: 10000 })
   await page.unroute('**/api/uploads/*/parts/*')
   const usedAfter = await used()
   const cancelled = (await apiAs(page, bearer, '/api/jobs')).body.jobs.find((j) => j.title === `cancel me ${run}`)
   await page.click('.upload-submit:text-is("try again")')
-  await page.waitForSelector('.quota:text-matches("of 3")')
-  const quotaAfter = await page.textContent('.quota')
+  await page.waitForFunction(([sel, q]) => document.querySelector(sel)?.getAttribute('aria-label') === q, [METER, quotaBefore], { timeout: 5000 }).catch(() => {})
+  const quotaAfter = (await quotaOf(page)).label
   check(usedDuring === usedAfter + 1 && cancelled?.state === 'failed' && cancelled?.error === 'cancelled' && quotaAfter === quotaBefore,
     `cancel mid-upload frees the slot: ${usedDuring} used while sending, ${usedAfter} after; the panel is back to "${quotaAfter}"`)
+
+  await page.fill('input[name=url]', 'http://127.0.0.1/never.mp4')
+  await page.fill('input[name=title]', `fails ${run}`)
+  await page.click('.upload-submit')
+  await page.waitForSelector('.panel.upload .journey .upload-error', { timeout: 60000 })
+  await page.click('.tab:text-is("my uploads")')
+  const failedRow = '.mine-list li[data-kind=failed]'
+  await page.waitForSelector(failedRow, { timeout: 10000 })
+  const failed = await page.$eval(failedRow, (li) => ({ title: li.querySelector('.row-title').textContent, reason: li.querySelector('.row-error').textContent, color: getComputedStyle(li.querySelector('.row-error')).color }))
+  const cancelledShown = await page.$$eval('.mine-list .row-title', (ts) => ts.some((t) => t.textContent.startsWith('cancel me')))
+  await page.waitForTimeout(500)
+  await shot(page, '9-failed-row')
+  await page.click(`${failedRow} .row-dismiss`)
+  await page.waitForSelector(failedRow, { state: 'detached', timeout: 5000 })
+  await page.click('.panel-close')
+  await corner(page, 'my uploads')
+  await page.waitForSelector('.mine-empty', { timeout: 5000 }).catch(() => {})
+  check(failed.title === `fails ${run}` && /private address/.test(failed.reason) && failed.color === 'rgb(217, 138, 138)' && !cancelledShown && !!(await page.$('.mine-empty')),
+    `a failed upload shows its reason in muted red ("${failed.reason}") until dismissed, and stays dismissed; the cancelled one is not listed`)
+  await page.click('.mine-empty button')
+  await clickIfShown(page, 'button:text-is("upload another")')
 
   // Fill this network's daily uploads from other browser ids, then the panel shows the per-IP refusal.
   const fillers = []
@@ -902,14 +1058,14 @@ async function prodChecks() {
   const jobs = page.waitForRequest((r) => new URL(r.url()).pathname === '/api/jobs')
   await page.click('.account-bar button:text-is("upload")')
   const sent = (await (await jobs).allHeaders()).authorization
-  await page.waitForSelector('.quota:text-matches("of 3")', { timeout: 15000 }).catch(() => {})
-  const quota = await page.textContent('.quota').catch(() => null)
+  await page.waitForSelector(`${METER}[aria-label$="left today"]`, { timeout: 15000 }).catch(() => {})
+  const quota = await page.getAttribute(METER, 'aria-label').catch(() => null)
   const bearer = await deviceToken(page)
   check(DEVICE_TOKEN.test(bearer ?? '') && sent === `Bearer ${bearer}` && quota === '3 of 3 uploads left today',
     `prod build: upload mints a browser id the API accepts (${sent}): "${quota}"`)
   await page.click('.account-bar button:text-is("my uploads")')
-  const note = await page.textContent('.panel.mine .mine-note').catch(() => null)
-  check(note === DEVICE_NOTE, `prod build: my uploads notes "${note}"`)
+  const note = await page.getAttribute('.panel-foot .browser-note', 'title').catch(() => null)
+  check(note === DEVICE_NOTE, `prod build: the panel footer notes "${note}"`)
   await shot(page, 'prod-device')
   console.log(`API origins called: ${[...api].join(', ')}`)
   await ctx.close()

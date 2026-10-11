@@ -13,14 +13,19 @@ sees, marked with a lilac bar under the strip's near end. What the top-right cor
 `uploads.mode` in `/api/library`, so the build needs no flag for it:
 
 - `device` (the API runs `VS_ANON_UPLOADS=1`): `upload` and `my uploads` links, no sign-in. The first upload mints a
-  random id (`src/device.ts`), kept in localStorage and sent as `Bearer device:<id>`. My uploads says that uploads are
-  tied to this browser. A browser that has uploaded before asks for the library a second time as itself before
+  random id (`src/device.ts`), kept in localStorage and sent as `Bearer device:<id>`. The panel's footer says
+  "saved to this browser", with the full caveat in its tooltip. A browser that has uploaded before asks for the library a second time as itself before
   anything shows, so its own strips arrive with the archive.
 - `account`: Auth0 (`@auth0/auth0-react`). `sign in` when signed out; signed in, an avatar menu with `upload`,
   `my uploads` and `sign out`. Shown only when this build has `VITE_AUTH0_DOMAIN` (or `VITE_DEV_AUTH` in dev).
 - `off`: no upload UI.
 
-A chip in the corner shows an upload's progress while it runs, even with the panel closed. Cancelling an upload, or
+Both links open one panel (`src/UploadPanel.tsx`) with `upload` and `my uploads` tabs and a dot meter of the day's
+uploads. The upload tab follows an upload through its steps under one overall progress bar that never goes back
+(`stepProgress` in `src/uploads.ts` weighs each step by its rough share of the time), then offers `view in archive`.
+My uploads lists running uploads first, then ready films (a frame still, duration, age; click to fly to the strip;
+delete asks inline) and failures with their reason until dismissed. A chip in the corner shows the same overall
+progress while an upload runs, even with the panel closed. Cancelling an upload, or
 a part that fails every retry, sends `DELETE /api/uploads/{id}` so it stops counting against the day's uploads.
 Every API call goes through `src/api.ts`, which adds the bearer token (the account's, else the browser id), retries
 a 401 once with a fresh token, then signs the user out with a message.
@@ -45,9 +50,12 @@ library API, atlas progress, failing atlas pages), the overview framing, atlas m
 the hover card's placement, frame still and video seek, search states and retries, camera travel, frame timing, and
 that a 3-film library still fits and draws. Then the upload half, in whichever mode the API advertises: quota,
 client-side refusals, a chunked upload of a 30 s clip with an injected part failure, the job's stages, the new
-private strip and the camera easing to it, search and privacy across two identities, URL errors and delete. Device
-mode adds the corner links, the browser id and its note, getting the strip back after a reload, cancel freeing the
-slot, and the per-IP limit's message. Account mode adds sign-in and an expired session. `ONLY=archive` or
+private strip and the camera easing to it, overall progress never going back, search and privacy across two
+identities, URL errors, the panel's tabs (fixed position, eased height), reduced motion, my uploads rows (thumbnail,
+duration, age, click to fly there), delete with its inline confirm, and the empty state. Device mode adds the corner
+links, the browser id and its note, getting the strip back after a reload, a running upload's row, cancel freeing the
+slot, a failed upload's row and dismiss, and the per-IP limit's message. Screenshots of panel states come with a 2x
+crop of the corner. Account mode adds sign-in and an expired session. `ONLY=archive` or
 `ONLY=uploads` runs one half; `ONLY=prod` checks a production build served by `vite preview`. The upload half fills
 the API's per-IP quota, so start the API fresh before each run (counts live in its memory). It needs a Chromium in
 `~/Library/Caches/ms-playwright` or `CHROMIUM=/path/to/chrome`.

@@ -94,6 +94,7 @@ export function App() {
   }, [refreshLibrary])
   const uploads = useUploads(viewer, onFilmReady)
   const onLibraryChanged = useCallback(() => { refreshLibrary().catch(() => {}) }, [refreshLibrary])
+  const showFilm = useCallback((filmId: FilmId) => setFocus({ filmId, at: Date.now() }), [])
   const onPageSettled = useCallback((url: string) => setLibrary((l) => pageSettled(l, url)), [])
 
   const films = library.status === 'ready' || library.status === 'frames' ? library.films : NO_FILMS
@@ -160,7 +161,7 @@ export function App() {
         <Scene layout={layout} search={search} hover={hover} stepped={stepped} focus={focus} onHover={onHover} onPageSettled={onPageSettled} anchorSink={anchorSink} />
       </div>
       <Masthead films={films.length ? films : null} />
-      {ready && uploadsMode && <AccountCorner mode={uploadsMode} uploads={uploads} films={films} onLibraryChanged={onLibraryChanged} onDeviceNeeded={ensureDevice} />}
+      {ready && uploadsMode && <AccountCorner mode={uploadsMode} uploads={uploads} films={films} onLibraryChanged={onLibraryChanged} onDeviceNeeded={ensureDevice} onShowFilm={showFilm} />}
       <Loader library={library} onRetry={retryLibrary} />
       {hover.kind === 'frame' && <HoverCard hover={hover} film={films.find((f) => f.id === hover.filmId)} sink={anchorSink} />}
       <SearchPill status={pillStatus(search, focusIndex)} disabled={!ready} onSubmit={submit} />
