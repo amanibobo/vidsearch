@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import { AccountCorner } from './Account'
-import { fetchLibrary, frameStillUrl, libraryLoaded, libraryRefreshed, momentAt, pageSettled, runSearch, setDeviceId, type Film, type FilmId, type Hover, type Library, type Moment, type Search, type UploadsMode } from './api'
+import { FALLBACK_IDENTITY, fetchLibrary, frameStillUrl, libraryLoaded, libraryRefreshed, momentAt, pageSettled, runSearch, setDeviceId, type Film, type FilmId, type Hover, type Library, type Moment, type Search, type UploadsMode } from './api'
 import { useAccount } from './auth'
 import { newDeviceId, storedDeviceId } from './device'
 import { layoutLibrary } from './layout'
@@ -44,6 +44,8 @@ export function App() {
   const [device, setDevice] = useState<string | null>(null)
   const viewer = uploadsMode === 'device' ? device : session.status === 'signed-in' ? session.viewer.sub : null
   const [focus, setFocus] = useState<FilmFocus | null>(null)
+  const [identity, setIdentity] = useState(FALLBACK_IDENTITY)
+  useEffect(() => { document.title = identity.title }, [identity.title])
   /** The viewer the library was last fetched for. */
   const loadedFor = useRef(viewer)
 
@@ -61,6 +63,7 @@ export function App() {
       const archive = id ? await fetchLibrary(ctrl.signal) : first
       loadedFor.current = archive.uploads === 'device' ? id : viewer
       setUploadsMode(archive.uploads)
+      setIdentity(archive.identity)
       setDevice(id)
       setLibrary(libraryLoaded(archive.films))
     }
@@ -160,8 +163,8 @@ export function App() {
       <div className={['stage', ready && 'shown', onResult && 'on-result'].filter(Boolean).join(' ')}>
         <Scene layout={layout} search={search} hover={hover} stepped={stepped} focus={focus} onHover={onHover} onPageSettled={onPageSettled} anchorSink={anchorSink} />
       </div>
-      <Masthead films={films.length ? films : null} />
-      {ready && uploadsMode && <AccountCorner mode={uploadsMode} uploads={uploads} films={films} onLibraryChanged={onLibraryChanged} onDeviceNeeded={ensureDevice} onShowFilm={showFilm} />}
+      <Masthead identity={identity} films={films.length ? films : null} />
+      {ready && uploadsMode && <AccountCorner mode={uploadsMode} noun={identity.noun} uploads={uploads} films={films} onLibraryChanged={onLibraryChanged} onDeviceNeeded={ensureDevice} onShowFilm={showFilm} />}
       <Loader library={library} onRetry={retryLibrary} />
       {hover.kind === 'frame' && <HoverCard hover={hover} film={films.find((f) => f.id === hover.filmId)} sink={anchorSink} />}
       <SearchPill status={pillStatus(search, focusIndex)} disabled={!ready} onSubmit={submit} />

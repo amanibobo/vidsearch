@@ -5,7 +5,14 @@ and new films are ingested and captioned on a GPU without touching this machine.
     modal run modal_app.py::add_film --url <video url> --name "Cops"  # download, ingest, caption (public)
     modal run modal_app.py::relocate_sources                         # after `modal volume put` from a Mac
 
-The Volume ("vidsearch") holds /videos/<name>.mp4 and /data/films/<id>/... exactly as the local layout,
+Each collection (vidsearch.config.COLLECTIONS) is its own deployment with its own names, chosen at deploy time:
+
+    VIDSEARCH_COLLECTION=traffic modal deploy modal_app.py           # app, Volume vidsearch-traffic, label vidsearch-traffic-web,
+                                                                     # Dict vidsearch-traffic-jobs
+    VIDSEARCH_COLLECTION=traffic modal run modal_app.py::add_film --url <video url> --name "..."
+
+Unset (or "keaton") keeps the original names: app and Volume "vidsearch", label "vidsearch-web", Dict "vidsearch-jobs".
+The Volume ("vidsearch", or "vidsearch-<collection>") holds /videos/<name>.mp4 and /data/films/<id>/... exactly as the local layout,
 plus /data/uploads/<job id>/ for the parts of in-flight browser uploads.
 Captions use the "vidsearch-anthropic" secret (ANTHROPIC_API_KEY, VS_CAPTION_MODEL):
     modal secret create vidsearch-anthropic --from-dotenv .env
@@ -27,12 +34,18 @@ from pathlib import Path
 
 import modal
 
+from vidsearch.config import DEFAULT_COLLECTION, collection_name
+
 ROOT = Path(__file__).parent
 VOL = "/vol"
 VIDEOS = f"{VOL}/videos"
 
-volume = modal.Volume.from_name("vidsearch", create_if_missing=True)
-jobs_dict = modal.Dict.from_name("vidsearch-jobs", create_if_missing=True)
+COLLECTION = collection_name()
+NAME = "vidsearch" if COLLECTION == DEFAULT_COLLECTION else f"vidsearch-{COLLECTION}"
+WEB_LABEL = f"{NAME}-web"
+
+volume = modal.Volume.from_name(NAME, create_if_missing=True)
+jobs_dict = modal.Dict.from_name(f"{NAME}-jobs", create_if_missing=True)
 
 
 def _bake_models() -> None:
@@ -51,10 +64,13 @@ image = (
     .env({"VS_DATA": f"{VOL}/data", "VS_VIDEOS": VIDEOS, "VS_WEB_DIST": "/web", "HF_HOME": "/models"})
     .add_local_python_source("vidsearch", copy=True)
     .run_function(_bake_models)
+    # Containers re-import this module, so they need the collection too, both for the names above and for
+    # Settings' per-collection defaults. After the model bake, so every collection shares that layer.
+    .env({"VIDSEARCH_COLLECTION": COLLECTION})
     .add_local_dir(ROOT / "web" / "dist", "/web")
 )
 
-app = modal.App("vidsearch", image=image)
+app = modal.App(NAME, image=image)
 
 
 # Query encoding (3 SigLIP text passes) measured 435 ms on 1 core, 77 ms on 4 with torch pinned to 4 threads.
@@ -92,7 +108,7 @@ class Web:
     def load_models(self) -> None:
         _bake_models()
 
-    @modal.asgi_app(label="vidsearch-web")
+    @modal.asgi_app(label=WEB_LABEL)
     def serve(self):
         from vidsearch.server import create_app
 

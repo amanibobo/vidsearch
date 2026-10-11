@@ -30,12 +30,24 @@ from PIL import Image
 from .config import Settings
 from .ingest import Log, Progress, frame_path, frame_ranges, no_progress
 
-PROMPT = (
-    "These are {n} frames, in order, from one continuous shot of a film. "
-    "In one or two plain sentences, describe what happens: who is visible, what they are doing, "
-    "the setting, and any movement or action (running, falling, chasing, fighting, etc.). "
-    "Be concrete and visual. Do not guess character or actor names. Do not mention 'frames'."
-)
+# Keyed by Settings.caption_style (VS_CAPTION_STYLE).
+PROMPTS = {
+    "film": (
+        "These are {n} frames, in order, from one continuous shot of a film. "
+        "In one or two plain sentences, describe what happens: who is visible, what they are doing, "
+        "the setting, and any movement or action (running, falling, chasing, fighting, etc.). "
+        "Be concrete and visual. Do not guess character or actor names. Do not mention 'frames'."
+    ),
+    "driving": (
+        "These are {n} frames, in order, from one continuous clip of road or traffic footage. "
+        "In one or two plain sentences, describe what happens: the vehicles (type, colour) and what they do "
+        "(turning, merging, braking, stopping, overtaking, cutting in, running a light, a near miss or collision), "
+        "any pedestrians or cyclists, traffic signals and signs, the kind of road (intersection, highway, roundabout, "
+        "parking lot), and the conditions (day or night, rain, snow, fog, glare). Say whether the camera is a dashcam "
+        "or in-car view or a fixed roadside camera. Be concrete and visual. Do not speculate about who anyone is. "
+        "Do not mention 'frames'."
+    ),
+}
 MAX_IMAGES = 4
 
 
@@ -59,6 +71,9 @@ def _pick_frames(f0: int, f1: int, k: int = MAX_IMAGES) -> list[int]:
 
 class Captioner:
     def __init__(self, s: Settings):
+        if s.caption_style not in PROMPTS:
+            raise ValueError(f"unknown VS_CAPTION_STYLE {s.caption_style!r}; known: {', '.join(PROMPTS)}")
+        self.prompt = PROMPTS[s.caption_style]
         self.model = s.caption_model
         if self.model.startswith("claude-"):
             import anthropic
@@ -75,7 +90,7 @@ class Captioner:
     def caption(self, frames: list[Path]) -> str:
         if self.claude:
             return self._caption_claude(frames)
-        content = [{"type": "text", "text": PROMPT.format(n=len(frames))}]
+        content = [{"type": "text", "text": self.prompt.format(n=len(frames))}]
         content += [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + _encode_frame(p)}} for p in frames]
         body = {"model": self.model, "messages": [{"role": "user", "content": content}], "max_tokens": 120, "temperature": 0.2}
         delay = 2.0
@@ -94,7 +109,7 @@ class Captioner:
     def _caption_claude(self, frames: list[Path]) -> str:
         content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": _encode_frame(p)}}
                    for p in frames]
-        content.append({"type": "text", "text": PROMPT.format(n=len(frames))})
+        content.append({"type": "text", "text": self.prompt.format(n=len(frames))})
         # Thinking is on by default and counts toward max_tokens; low effort keeps it short.
         msg = self.claude.messages.create(model=self.model, max_tokens=1024, output_config={"effort": "low"},
                                           messages=[{"role": "user", "content": content}])

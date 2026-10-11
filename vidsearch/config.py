@@ -1,4 +1,6 @@
-"""Settings, read from environment variables (VS_*) with sensible defaults."""
+"""Settings, read from environment variables (VS_*) with sensible defaults.
+
+VIDSEARCH_COLLECTION picks which archive's defaults apply (COLLECTIONS); empty means Keaton."""
 
 from __future__ import annotations
 
@@ -11,13 +13,50 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+@dataclass(frozen=True)
+class Collection:
+    """One archive's identity and defaults. Each VS_* setting below can still override its field."""
+    title: str
+    noun: str           # what one item is called in the UI; the plural adds "s" unless VS_ITEM_NOUN_PLURAL says otherwise
+    caption_style: str  # key into caption.PROMPTS
+    sample_fps: float
+    # Phrasings of a search query whose SigLIP text vectors are averaged into the query vector.
+    query_templates: tuple[str, ...]
+
+
+DEFAULT_COLLECTION = "keaton"
+COLLECTIONS = {
+    # "film still" phrasings help on old black-and-white footage.
+    "keaton": Collection(title="The Keaton Archive", noun="film", caption_style="film", sample_fps=1.0,
+                         query_templates=("{}", "a film still of {}", "a black and white movie scene of {}")),
+    "traffic": Collection(title="The Traffic Archive", noun="clip", caption_style="driving", sample_fps=2.0,
+                          query_templates=("{}", "a dashcam photo of {}", "a traffic camera image of {}")),
+}
+
+
+def collection_name() -> str:
+    """VIDSEARCH_COLLECTION, checked against COLLECTIONS; empty means the default."""
+    name = os.environ.get("VIDSEARCH_COLLECTION", "") or DEFAULT_COLLECTION
+    if name not in COLLECTIONS:
+        raise ValueError(f"unknown VIDSEARCH_COLLECTION {name!r}; known: {', '.join(COLLECTIONS)}")
+    return name
+
+
+def _collection() -> Collection:
+    return COLLECTIONS[collection_name()]
+
+
+def _noun() -> str:
+    return _env("VS_ITEM_NOUN", _collection().noun)
+
+
 @dataclass
 class Settings:
     # Where per-film artifacts (frames, atlases, embeddings) are written.
     data_dir: Path = field(default_factory=lambda: Path(_env("VS_DATA", "data")))
 
     # Frame sampling
-    sample_fps: float = field(default_factory=lambda: float(_env("VS_SAMPLE_FPS", "1.0")))
+    sample_fps: float = field(default_factory=lambda: float(_env("VS_SAMPLE_FPS", str(_collection().sample_fps))))
     frame_width: int = field(default_factory=lambda: int(_env("VS_FRAME_WIDTH", "384")))
 
     # Shot detection: "content" (PySceneDetect default, HSV frame diff) or "adaptive"
@@ -36,12 +75,20 @@ class Settings:
 
     # Captions are generated per shot chunk; long shots are split into chunks
     caption_chunk_sec: float = field(default_factory=lambda: float(_env("VS_CAPTION_CHUNK_SEC", "12")))
+    # Which prompt describes a chunk (caption.PROMPTS): "film" or "driving".
+    caption_style: str = field(default_factory=lambda: _env("VS_CAPTION_STYLE", _collection().caption_style))
+
+    # What the frontend calls the archive and its items (masthead, tab title, stats line, upload copy).
+    archive_title: str = field(default_factory=lambda: _env("VS_ARCHIVE_TITLE", _collection().title))
+    item_noun: str = field(default_factory=_noun)
+    item_noun_plural: str = field(default_factory=lambda: _env("VS_ITEM_NOUN_PLURAL", _noun() + "s"))
 
     # Models
     image_model: str = field(default_factory=lambda: _env("VS_IMAGE_MODEL", "ViT-B-16-SigLIP2"))
     image_pretrained: str = field(default_factory=lambda: _env("VS_IMAGE_PRETRAINED", "webli"))
     text_model: str = field(default_factory=lambda: _env("VS_TEXT_MODEL", "BAAI/bge-small-en-v1.5"))
     device: str = field(default_factory=lambda: _env("VS_DEVICE", ""))  # "" = auto
+    query_templates: tuple[str, ...] = field(default_factory=lambda: _collection().query_templates)
 
     # OpenAI-compatible vision endpoint for captions (OpenAI, Gemini, OpenRouter, vLLM, Ollama...)
     caption_base_url: str = field(default_factory=lambda: _env("VS_CAPTION_BASE_URL", "https://api.openai.com/v1"))

@@ -7,7 +7,10 @@
 // Device mode (VS_ANON_UPLOADS=1, no auth env on the dev server) adds the browser-identity corner, running and failed
 // rows, cancel giving the slot back and the per-IP cap; account mode (VS_DEV_AUTH=1 and VITE_DEV_AUTH=tester) adds sign-in and expired sessions.
 // Usage: node scripts/verify.mjs <outDir> <label>   (env BASE_URL, default http://localhost:5199; CHROMIUM to override the binary;
-// ONLY=archive or ONLY=uploads runs one half; ONLY=prod checks a production build served by `vite preview` instead).
+// ONLY=archive or ONLY=uploads runs one half; ONLY=prod checks a production build served by `vite preview` instead;
+// ONLY=collection checks any collection's API (not just Keaton's films): its title, nouns, upload copy and hover seek on
+// every film sampled at other than 1 fps; SERVED_PAGE=<the API's own URL, run with VS_WEB_DIST> adds the title it serves).
+// Title, nouns and stats are checked against the API's `archive` in /api/library.
 // The upload half makes its 30 s clip from ../videos/Cops.mp4 with ffmpeg and fills the API's per-IP quota, so give it
 // a freshly started API (job records and counts live in its memory).
 import { chromium } from 'playwright-core'
@@ -24,7 +27,7 @@ const ATLAS_FILM = 'one-week'
 const ATLAS_FRAMES = [0, 700, 1335, 1336]
 const CARD_ATLAS_RANKS = [0, 1, 2]
 const INPUT = 'input[aria-label="Search"]'
-const ARCHIVE_TITLE = process.env.VITE_ARCHIVE_TITLE || 'The Keaton Archive'
+const IDENTITY = (await (await fetch(new URL('/api/library', BASE))).json()).archive
 const WAITING_PLACEHOLDER = 'waiting for the archive…'
 const ONLY = process.env.ONLY ?? ''
 const DEV_USER = 'tester'
@@ -54,8 +57,10 @@ const instrument = () => {
 const loaderLines = (page) => page.evaluate(() => window.__loaderLines.map((l) => l.line))
 const libraryStats = (films) => {
   const minutes = Math.round(films.reduce((s, f) => s + f.duration, 0) / 60)
+  const h = Math.floor(minutes / 60), m = minutes % 60
+  const runtime = h && m ? `${h} h ${m} min` : h ? `${h} h` : `${m} min`
   const frames = films.reduce((n, f) => n + f.n_frames, 0)
-  return `${films.length} films · ${Math.floor(minutes / 60)} h ${minutes % 60} min · ${frames.toLocaleString('en-US')} frames`
+  return `${films.length} ${films.length === 1 ? IDENTITY.noun : IDENTITY.noun_plural} · ${runtime} · ${frames.toLocaleString('en-US')} frames`
 }
 const ready = (page, timeout = 20000) => page.waitForSelector('.loader', { state: 'detached', timeout })
 
@@ -186,6 +191,7 @@ async function measureFps(page) {
 const browser = await chromium.launch({ executablePath: findChromium(), headless: true, args: (process.env.CHROMIUM_ARGS ?? '').split(' ').filter(Boolean) })
 try {
   if (ONLY === 'prod') await prodChecks()
+  else if (ONLY === 'collection') await collectionChecks()
   else {
     if (ONLY !== 'uploads') await archiveChecks()
     if (ONLY !== 'archive') await uploadChecks()
@@ -228,7 +234,7 @@ async function archiveChecks() {
   check(progress.filter((p) => !p.line.endsWith(`${pages} / ${pages}`)).every((p) => !p.stageShown) && await page.evaluate(() => getComputedStyle(document.querySelector('.stage')).opacity) === '1',
     'strips stay hidden while pages load, then fade in; the loader is gone')
   const masthead = { title: await page.textContent('.masthead-title'), stats: await page.textContent('.masthead-stats'), doc: await page.title() }
-  check(masthead.title === ARCHIVE_TITLE && masthead.doc === ARCHIVE_TITLE, `archive title "${masthead.title}", document title "${masthead.doc}"`)
+  check(masthead.title === IDENTITY.title && masthead.doc === IDENTITY.title, `archive title "${masthead.title}", document title "${masthead.doc}" (the API's "${IDENTITY.title}")`)
   check(masthead.stats === libraryStats(library), `archive stats from /api/library: "${masthead.stats}" (expected "${libraryStats(library)}")`)
   check(!(await page.isDisabled(INPUT)) && await page.getAttribute(INPUT, 'placeholder') === 'search the archive', 'search pill enabled once the archive is ready')
 
@@ -876,10 +882,12 @@ async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
 
   await page.waitForSelector('.mine-empty', { timeout: 10000 }).catch(() => {})
   const empty = await page.textContent('.mine-empty p').catch(() => null)
+  const emptyButton = await page.textContent('.mine-empty button').catch(() => null)
   await shots(page, '6-empty')
   await page.click('.mine-empty button')
   const switched = await page.$eval('.tab[aria-selected=true]', (t) => t.textContent).catch(() => null)
-  check(empty === 'nothing uploaded yet' && switched === 'upload' && !!(await page.$('.panel.upload .upload-form')), `the empty list says "${empty}" and its button switches to the ${switched} tab`)
+  check(empty === 'nothing uploaded yet' && emptyButton === `upload a ${IDENTITY.noun}` && switched === 'upload' && !!(await page.$('.panel.upload .upload-form')),
+    `the empty list says "${empty}" and its "${emptyButton}" button switches to the ${switched} tab`)
   return filmId
 }
 
@@ -1068,5 +1076,102 @@ async function prodChecks() {
   check(note === DEVICE_NOTE, `prod build: the panel footer notes "${note}"`)
   await shot(page, 'prod-device')
   console.log(`API origins called: ${[...api].join(', ')}`)
+  await ctx.close()
+}
+
+/** Any collection's API: what the page calls the archive and its items, and hover seek on films not sampled at 1 fps. */
+async function collectionChecks() {
+  const ctx = await browser.newContext({ viewport: VIEWPORT })
+  const page = await ctx.newPage()
+  page.on('pageerror', (e) => failures.push(`pageerror (collection): ${e.message}`))
+  await page.addInitScript(instrument)
+  const preload = (await (await fetch(BASE)).text()).match(/<title>(.*?)<\/title>/)?.[1]
+  await page.route('**/api/library', async (r) => { await new Promise((ok) => setTimeout(ok, 1500)); await r.continue().catch(() => {}) })
+  await page.goto(BASE)
+  await page.waitForSelector('.masthead-title')
+  const before = { title: await page.textContent('.masthead-title'), doc: await page.title() }
+  check(before.title === preload && before.doc === preload, `before /api/library answers the masthead and tab show the page's own title "${preload}": "${before.title}", "${before.doc}"`)
+  await page.waitForFunction(() => window.__vidsearch?.settled())
+  await ready(page)
+  await page.unroute('**/api/library')
+  const library = await page.evaluate(async () => (await (await fetch('/api/library')).json()).films)
+  console.log('films:', library.map((f) => `${f.id} (${f.n_frames} at ${f.sample_fps} fps)`).join(', '))
+  const masthead = { title: await page.textContent('.masthead-title'), stats: await page.textContent('.masthead-stats'), doc: await page.title() }
+  check(masthead.title === IDENTITY.title && masthead.doc === IDENTITY.title, `then they show the API's title: "${masthead.title}", tab "${masthead.doc}"`)
+  check(masthead.stats === libraryStats(library), `stats count ${IDENTITY.noun_plural}: "${masthead.stats}" (expected "${libraryStats(library)}")`)
+  await shot(page, 'collection-overview')
+
+  await page.click('.account-bar button:text-is("my uploads")')
+  await page.waitForSelector('.panel.mine .mine-empty', { timeout: 10000 }).catch(() => {})
+  const empty = { line: await page.textContent('.mine-empty p').catch(() => null), button: await page.textContent('.mine-empty button').catch(() => null) }
+  await shots(page, 'collection-empty')
+  await page.click('.mine-empty button')
+  const placeholder = await page.getAttribute('.panel.upload input[name=url]', 'placeholder')
+  check(empty.line === 'nothing uploaded yet' && empty.button === `upload a ${IDENTITY.noun}` && placeholder === `https://…/${IDENTITY.noun}.mp4`,
+    `upload copy uses "${IDENTITY.noun}": "${empty.line}", "${empty.button}", link placeholder "${placeholder}"`)
+  await page.click('.panel-close')
+
+  const settle = async () => {
+    await page.waitForTimeout(100)
+    await page.waitForFunction(() => window.__vidsearch.settled(), null, { timeout: 15000 })
+    await page.waitForTimeout(400)
+  }
+  await page.evaluate(() => document.addEventListener('seeked', (e) => { window.__seekedTo = e.target.currentTime }, true))
+  const seekOf = async () => {
+    await page.waitForFunction(() => { const v = document.querySelector('.card video'); return v && v.readyState >= 2 && !v.seeking && window.__seekedTo !== undefined }, null, { timeout: 15000 })
+    return page.evaluate(() => ({ seekedTo: window.__seekedTo, label: document.querySelector('.card-label').textContent, still: document.querySelector('.card-still img')?.getAttribute('src') ?? null }))
+  }
+  const odd = library.filter((f) => f.sample_fps !== 1)
+  check(odd.length > 0, `the library has films sampled at other than 1 fps: ${odd.map((f) => `${f.id} @ ${f.sample_fps}`).join(', ')}`)
+  for (const film of odd) {
+    const frame = Math.floor(film.n_frames * 0.6)
+    const at = frame / film.sample_fps
+    await page.mouse.move(5, 5)
+    await page.evaluate(() => { window.__seekedTo = undefined })
+    await page.evaluate(([id, f]) => window.__vidsearch.focusFrame(id, f, 150), [film.id, frame])
+    await settle()
+    const xy = await page.evaluate(([id, f]) => window.__vidsearch.screenOf(id, f), [film.id, frame])
+    await page.route('**/api/video/**', async (r) => { await new Promise((ok) => setTimeout(ok, 800)); await r.continue().catch(() => {}) })
+    await page.mouse.move(xy.x - 2, xy.y)
+    await page.mouse.move(xy.x, xy.y)
+    await page.waitForSelector('.card video')
+    const still = await page.getAttribute('.card-still img', 'src').catch(() => null)
+    await page.unroute('**/api/video/**')
+    const seek = await seekOf()
+    await shot(page, `collection-hover-${film.id}`)
+    check(Math.abs(seek.seekedTo - at) < 0.3 && seek.label === `${film.title} · ${clock(at)}` && still === frameUrl(film.id, frame),
+      `hovering ${film.id} frame ${frame} at ${film.sample_fps} fps seeks to ${seek.seekedTo?.toFixed(2)} s (expected ${at}), labels "${seek.label}", still ${still}`)
+  }
+
+  await page.evaluate(() => window.__vidsearch.showOverview())
+  await settle()
+  await page.mouse.move(5, 5)
+  const { body } = await uiSearch(page, 'a car on the street')
+  const top = body.results[0]
+  const fps = library.find((f) => f.id === top.film_id).sample_fps
+  check(Math.abs(top.t - top.frame / fps) < 1e-3 && top.start <= top.t && top.t < top.end && top.end - top.start <= 3.0 + 1e-6,
+    `search times are seconds at ${fps} fps: t ${top.t} = frame ${top.frame} / ${fps}, moment ${top.start}-${top.end}`)
+  await page.waitForTimeout(1500)
+  await page.evaluate(() => { window.__seekedTo = undefined })
+  // ArrowDown rather than pointing at the lifted card: in a library of one short clip the cards rise past the top of the view.
+  await page.keyboard.press('ArrowDown')
+  await page.waitForSelector('.card video')
+  const seek = await seekOf()
+  await shot(page, 'collection-result')
+  check(Math.abs(seek.seekedTo - top.start) < 0.3 && seek.label === `${top.title} · ${clock(top.start)}`,
+    `stepping to the top result seeks to ${seek.seekedTo?.toFixed(2)} s (result start ${top.start}), labels "${seek.label}"; caption: ${JSON.stringify(top.caption)}`)
+
+  if (process.env.SERVED_PAGE) {
+    const served = await ctx.newPage()
+    served.on('pageerror', (e) => failures.push(`pageerror (served page): ${e.message}`))
+    await served.route('**/api/library', async (r) => { await new Promise((ok) => setTimeout(ok, 1500)); await r.continue().catch(() => {}) })
+    await served.goto(process.env.SERVED_PAGE)
+    await served.waitForSelector('.masthead-title')
+    const early = { title: await served.textContent('.masthead-title'), doc: await served.title() }
+    await served.waitForSelector('.masthead-stats', { timeout: 20000 })
+    const later = { title: await served.textContent('.masthead-title'), doc: await served.title() }
+    check([early.title, early.doc, later.title, later.doc].every((t) => t === IDENTITY.title),
+      `the page the API serves names "${IDENTITY.title}" before and after /api/library: ${JSON.stringify({ early, later })}`)
+  }
   await ctx.close()
 }

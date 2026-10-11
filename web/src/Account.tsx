@@ -27,8 +27,10 @@ function cornerFor(mode: UploadsMode, session: Session): Corner {
  * Top-right corner. Account mode: `sign in` when signed out; signed in, an initial with a menu. Device mode: `upload`
  * and `my uploads` links. Either way one uploads panel with those two tabs, and a progress chip while an upload runs.
  */
-export function AccountCorner({ mode, uploads, films, onLibraryChanged, onDeviceNeeded, onShowFilm }: {
+export function AccountCorner({ mode, noun, uploads, films, onLibraryChanged, onDeviceNeeded, onShowFilm }: {
   mode: UploadsMode
+  /** What one item of this archive is called, for the panel's copy. */
+  noun: string
   uploads: Uploads
   films: readonly Film[]
   onLibraryChanged: () => void
@@ -105,6 +107,7 @@ export function AccountCorner({ mode, uploads, films, onLibraryChanged, onDevice
           onTab={openTab}
           onClose={close}
           onClosed={() => setPanel((p) => (p.kind === 'closing' ? { kind: 'closed' } : p))}
+          noun={noun}
           uploads={uploads}
           films={films}
           viewing={viewing}

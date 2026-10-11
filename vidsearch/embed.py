@@ -18,10 +18,6 @@ from PIL import Image
 
 from .config import Settings
 
-# Query templates for the image-text model. Averaging a raw query with a
-# "film still" phrasing helps on old black-and-white footage.
-QUERY_TEMPLATES = ("{}", "a film still of {}", "a black and white movie scene of {}")
-
 # bge models expect this prefix on queries (not on passages).
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
@@ -74,9 +70,9 @@ class ImageTextEmbedder:
             feats = self.model.encode_text(tokens)
         return _normalize(feats.float().cpu().numpy())
 
-    def encode_query(self, query: str) -> np.ndarray:
-        """Template-ensembled query vector, shape (dim,)."""
-        vecs = self.encode_texts([t.format(query) for t in QUERY_TEMPLATES])
+    def encode_query(self, query: str, templates: Sequence[str]) -> np.ndarray:
+        """Template-ensembled query vector, shape (dim,). templates: Settings.query_templates, e.g. "a film still of {}"."""
+        vecs = self.encode_texts([t.format(query) for t in templates])
         return _normalize(vecs.mean(axis=0))
 
 

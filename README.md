@@ -190,6 +190,35 @@ modal deploy modal_app.py
 modal run modal_app.py::add_film --url <video url> --name "Cops"  # admin: a public film
 ```
 
+**Collections.** One codebase serves several archives, each a separate deployment with its own URL, Volume,
+job records and title. `VIDSEARCH_COLLECTION` picks one at deploy time from `COLLECTIONS` in
+`vidsearch/config.py`; unset (or `keaton`) is the original Keaton archive, with every name unchanged:
+
+| Collection | Title | Items | Captions (`caption.PROMPTS`) | Sample fps | SigLIP query templates |
+|---|---|---|---|---|---|
+| `keaton` (default) | The Keaton Archive | film / films | `film` | 1 | `{}`, `a film still of {}`, `a black and white movie scene of {}` |
+| `traffic` | The Traffic Archive | clip / clips | `driving` | 2 | `{}`, `a dashcam photo of {}`, `a traffic camera image of {}` |
+
+| Collection | Modal app and Volume | Web label (URL) | Jobs Dict |
+|---|---|---|---|
+| `keaton` | `vidsearch` | `vidsearch-web` | `vidsearch-jobs` |
+| `traffic` | `vidsearch-traffic` | `vidsearch-traffic-web` | `vidsearch-traffic-jobs` |
+
+```bash
+modal deploy modal_app.py                                                      # Keaton
+VIDSEARCH_COLLECTION=traffic modal deploy modal_app.py                         # https://<workspace>--vidsearch-traffic-web.modal.run
+VIDSEARCH_COLLECTION=traffic modal run modal_app.py::add_film --url <video url> --name "Junction at dusk"
+modal volume put vidsearch-traffic data/films/<id> /data/films/<id>            # after a local ingest:
+modal volume put vidsearch-traffic videos/<file>.mp4 /videos/<file>.mp4        #   VIDSEARCH_COLLECTION=traffic python -m vidsearch ingest ...
+VIDSEARCH_COLLECTION=traffic modal run modal_app.py::relocate_sources
+```
+
+Both collections share the `vidsearch-anthropic` and `vidsearch-auth0` secrets, the upload limits and browser ids.
+The deploy bakes `VIDSEARCH_COLLECTION` into the image, so containers derive the same names and defaults.
+Locally, `VIDSEARCH_COLLECTION=traffic` sets the same defaults (use a separate `VS_DATA` and `VS_VIDEOS`).
+`/api/library` returns the title and nouns as `archive: {title, noun, noun_plural}`, and the API rewrites the
+`<title>` of the page it serves, so the frontend build is the same for every collection.
+
 The `vidsearch` Volume holds `/videos` and `/data`, the same layout as local. The `Web` class
 writes upload parts to the Volume, assembles them, commits, and spawns `process_job` on an L4
 GPU. That function reloads the Volume, runs the same job body as local (download, probe,
@@ -263,7 +292,10 @@ All settings are environment variables (`vidsearch/config.py`):
 | Var | Default | Notes |
 |---|---|---|
 | `VS_DATA` | `data` | output dir |
-| `VS_SAMPLE_FPS` | `1.0` | 2.0 catches quick gags; doubles embed time |
+| `VIDSEARCH_COLLECTION` | `keaton` | which collection's defaults below apply (see "Collections") |
+| `VS_SAMPLE_FPS` | per collection (`1.0`, traffic `2.0`) | 2.0 catches quick gags; doubles embed time |
+| `VS_CAPTION_STYLE` | per collection (`film`, traffic `driving`) | which caption prompt (`caption.PROMPTS`) |
+| `VS_ARCHIVE_TITLE` / `VS_ITEM_NOUN` / `VS_ITEM_NOUN_PLURAL` | per collection / noun + `s` | what the frontend calls the archive and one item |
 | `VS_SHOT_DETECTOR` | `content` | `adaptive` tolerates flicker and camera motion but can miss cuts |
 | `VS_SHOT_THRESHOLD` | content 18, adaptive 3.0 | lower = more cuts. 18 is below PySceneDetect's 27 because faded silent prints hide cuts; under ~15 flicker starts reading as cuts. Grayscale prints are detected and scored on brightness only |
 | `VS_WINDOW_SEC` / `VS_WINDOW_STRIDE` | `3` / `1` | moment length and step |

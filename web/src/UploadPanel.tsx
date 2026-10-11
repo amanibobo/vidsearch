@@ -10,13 +10,14 @@ const DEVICE_NOTE = 'uploads are tied to this browser; clearing site data loses 
 const CLOSE_MS = 160
 
 /** The uploads panel: `upload` and `my uploads` tabs in one card that stays put and eases its height between them. */
-export function Panel({ tab, closing, onTab, onClose, onClosed, uploads, films, viewing, onView, browserOnly, onLibraryChanged, onShowFilm }: {
+export function Panel({ tab, closing, onTab, onClose, onClosed, noun, uploads, films, viewing, onView, browserOnly, onLibraryChanged, onShowFilm }: {
   tab: Tab
   closing: boolean
   onTab: (tab: Tab) => void
   onClose: () => void
   /** The close animation has played; unmount. */
   onClosed: () => void
+  noun: string
   uploads: Uploads
   films: readonly Film[]
   viewing: string | null
@@ -48,8 +49,8 @@ export function Panel({ tab, closing, onTab, onClose, onClosed, uploads, films, 
       <AutoHeight>
         <div className="tab-pane" key={tab} role="tabpanel">
           {tab === 'upload'
-            ? <UploadTab uploads={uploads} viewing={viewing} onView={onView} onShowFilm={onShowFilm} />
-            : <MyUploads uploads={uploads} films={films} onTab={onTab} onLibraryChanged={onLibraryChanged} onShowFilm={onShowFilm} />}
+            ? <UploadTab noun={noun} uploads={uploads} viewing={viewing} onView={onView} onShowFilm={onShowFilm} />
+            : <MyUploads noun={noun} uploads={uploads} films={films} onTab={onTab} onLibraryChanged={onLibraryChanged} onShowFilm={onShowFilm} />}
         </div>
       </AutoHeight>
       {browserOnly && <footer className="panel-foot"><span className="browser-note" title={DEVICE_NOTE}>saved to this browser</span></footer>}
@@ -132,16 +133,16 @@ const Check = () => <svg className="check" viewBox="0 0 12 12" aria-hidden="true
 
 // ---------------------------------------------------------------- upload tab
 
-function UploadTab({ uploads, viewing, onView, onShowFilm }: { uploads: Uploads; viewing: string | null; onView: (key: string | null) => void; onShowFilm: (id: FilmId) => void }) {
+function UploadTab({ noun, uploads, viewing, onView, onShowFilm }: { noun: string; uploads: Uploads; viewing: string | null; onView: (key: string | null) => void; onShowFilm: (id: FilmId) => void }) {
   const shown = uploads.list.find((u) => u.key === viewing)
   return shown
     ? <Journey upload={shown} onCancel={() => uploads.cancel(shown.key)} onAnother={() => onView(null)} onShowFilm={onShowFilm} />
-    : <UploadForm uploads={uploads} onStarted={onView} />
+    : <UploadForm noun={noun} uploads={uploads} onStarted={onView} />
 }
 
 type Picked = { kind: 'none' } | { kind: 'file'; file: File } | { kind: 'url'; url: string }
 
-function UploadForm({ uploads, onStarted }: { uploads: Uploads; onStarted: (key: string) => void }) {
+function UploadForm({ noun, uploads, onStarted }: { noun: string; uploads: Uploads; onStarted: (key: string) => void }) {
   const [source, setSource] = useState<Picked>({ kind: 'none' })
   const [title, setTitle] = useState('')
   const [dragging, setDragging] = useState(false)
@@ -185,7 +186,7 @@ function UploadForm({ uploads, onStarted }: { uploads: Uploads; onStarted: (key:
           name="url"
           type="text"
           inputMode="url"
-          placeholder="https://…/film.mp4"
+          placeholder={`https://…/${noun}.mp4`}
           spellCheck={false}
           value={source.kind === 'url' ? source.url : ''}
           onChange={(e) => setSource(e.target.value ? { kind: 'url', url: e.target.value } : { kind: 'none' })}
@@ -341,7 +342,8 @@ function saveDismissed(ids: ReadonlySet<string>) {
 
 const ROW_LEAVE_MS = 220
 
-function MyUploads({ uploads, films, onTab, onLibraryChanged, onShowFilm }: {
+function MyUploads({ noun, uploads, films, onTab, onLibraryChanged, onShowFilm }: {
+  noun: string
   uploads: Uploads
   films: readonly Film[]
   onTab: (tab: Tab) => void
@@ -391,7 +393,7 @@ function MyUploads({ uploads, films, onTab, onLibraryChanged, onShowFilm }: {
     return (
       <div className="mine-empty">
         <p>nothing uploaded yet</p>
-        <button type="button" className="upload-submit" onClick={() => onTab('upload')}>upload a film</button>
+        <button type="button" className="upload-submit" onClick={() => onTab('upload')}>upload a {noun}</button>
       </div>
     )
   }

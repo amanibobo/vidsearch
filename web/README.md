@@ -2,7 +2,10 @@
 
 The whole library as strips of frame slices on a tilted plane, with one search pill. Results dim the archive,
 light matching frames in lilac and lift the top 12 as cards. Hover a card or a frame to play it; arrow keys step
-through results. The archive title comes from `VITE_ARCHIVE_TITLE` (default `The Keaton Archive`).
+through results. The archive's title and what it calls an item (`film`, `clip`) come from the API's `archive` in
+`/api/library`, for the masthead, the tab title, the stats line and the upload copy. Until the API answers, the title is
+`VITE_ARCHIVE_TITLE`, else the page's `<title>` (`The Keaton Archive` in `index.html`; the API rewrites it to its own
+collection's when it serves the build).
 
 The API may be cold (it scales to zero): the library request retries transient failures (network errors, 5xx) with
 backoff for up to 60 s behind a centred loader before offering a retry button, searches retry twice, and each atlas
@@ -56,7 +59,9 @@ duration, age, click to fly there), delete with its inline confirm, and the empt
 links, the browser id and its note, getting the strip back after a reload, a running upload's row, cancel freeing the
 slot, a failed upload's row and dismiss, and the per-IP limit's message. Screenshots of panel states come with a 2x
 crop of the corner. Account mode adds sign-in and an expired session. `ONLY=archive` or
-`ONLY=uploads` runs one half; `ONLY=prod` checks a production build served by `vite preview`. The upload half fills
+`ONLY=uploads` runs one half; `ONLY=prod` checks a production build served by `vite preview`. `ONLY=collection` checks any
+collection's API: the title before and after the library loads, the stats and upload copy in its nouns, and hover seek
+on every film sampled at other than 1 fps (`SERVED_PAGE=<API URL>` adds the page the API serves with `VS_WEB_DIST`). The upload half fills
 the API's per-IP quota, so start the API fresh before each run (counts live in its memory). It needs a Chromium in
 `~/Library/Caches/ms-playwright` or `CHROMIUM=/path/to/chrome`.
 

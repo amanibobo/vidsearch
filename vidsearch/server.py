@@ -1,7 +1,8 @@
 """FastAPI server for the frontend.
 
     GET    /api/library                 films the caller can see, shot boundaries, atlas layout + urls,
-                                        and `uploads`: {mode: off | device | account, limits}
+                                        `uploads`: {mode: off | device | account, limits},
+                                        and `archive`: {title, noun, noun_plural} (what to call it and its items)
     GET    /api/search?q=...&k=24       ranked moments (film, timestamp, best frame, atlas cell...)
     GET    /api/heatmap?q=...           per-frame relevance for every visible film (glowing strip ticks)
     GET    /api/video/{film_id}         the source video (supports Range, so <video> can seek)
@@ -23,7 +24,9 @@ Run:  python -m vidsearch serve   (or)   uvicorn vidsearch.server:app --reload
 
 from __future__ import annotations
 
+import html
 import logging
+import re
 import secrets
 import shutil
 import threading
@@ -35,7 +38,7 @@ from typing import Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -90,6 +93,7 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
               "uploads_global_per_day": s.uploads_global_per_day, "max_bytes": s.max_upload_bytes,
               "max_minutes": s.max_upload_minutes, "part_size": s.upload_part_bytes}
     uploads = {"mode": uploads_mode(s), "limits": limits}
+    archive = {"title": s.archive_title, "noun": s.item_noun, "noun_plural": s.item_noun_plural}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -150,7 +154,7 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
     def library(user: str | None = Depends(optional_user)):
         if user:  # a few recent jobs is enough: each is a store read (a modal.Dict call on Modal)
             observe(jobs.for_owner(user, limit=5))
-        return {**L().library_json(user), "uploads": uploads}
+        return {**L().library_json(user), "uploads": uploads, "archive": archive}
 
     @app.get("/api/search")
     def search(
@@ -306,6 +310,13 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
     s.films_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/media", StaticFiles(directory=s.films_dir), name="media")
     if s.web_dist:
+        @app.get("/", include_in_schema=False)
+        def index_page():
+            # The tab and masthead name this archive before /api/library answers (the build's own title is Keaton's).
+            page = (Path(s.web_dist) / "index.html").read_text()
+            title = f"<title>{html.escape(s.archive_title)}</title>"
+            return HTMLResponse(re.sub(r"<title>.*?</title>", lambda _: title, page, count=1))
+
         app.mount("/", StaticFiles(directory=s.web_dist, html=True), name="web")
     return app
 

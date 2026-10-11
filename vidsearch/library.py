@@ -63,7 +63,8 @@ class Library:
         self._image_embedder = image_embedder
         self._text_embedder = text_embedder
         self.log = log
-        # Query vectors depend only on the model, not the library, so they survive reload().
+        # Query vectors depend only on the model and the collection's query templates, not the library, so they
+        # survive reload(). Keyed by query text alone: both are fixed for the life of this Library.
         self.query_vector = lru_cache(maxsize=512)(self._encode_query)
         self.reload()
 
@@ -176,7 +177,7 @@ class Library:
         return self._text_embedder
 
     def _encode_query(self, query: str) -> np.ndarray:
-        return self.image_embedder.encode_query(query).astype(np.float32)
+        return self.image_embedder.encode_query(query, self.s.query_templates).astype(np.float32)
 
     def warm(self) -> None:
         """Load models now instead of on the first query."""

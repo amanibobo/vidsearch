@@ -37,7 +37,7 @@ class StubImage:
     def encode_images(self, ims):
         return np.stack([_feat(np.asarray(im.convert("RGB")).reshape(-1, 3).mean(0)) for im in ims])
 
-    def encode_query(self, q):
+    def encode_query(self, q, templates):
         return next((_feat(c) for w, c in COLORS.items() if w in q), _feat((128, 128, 128)))
 
 
@@ -170,7 +170,7 @@ def test_api(lib):
 def test_query_encoded_once_across_search_and_heatmap(lib, monkeypatch):
     calls = []
     real = lib.image_embedder.encode_query
-    monkeypatch.setattr(lib.image_embedder, "encode_query", lambda q: calls.append(q) or real(q))
+    monkeypatch.setattr(lib.image_embedder, "encode_query", lambda q, t: calls.append(q) or real(q, t))
     lib.search("a blue door")
     lib.heatmap("a blue door")
     lib.search("a blue door", k=3)
@@ -182,12 +182,12 @@ def test_api_serves_frontend_and_runs_reload_hook(lib, tmp_path):
 
     from vidsearch.server import create_app
 
-    (tmp_path / "index.html").write_text("<title>vidsearch</title>")
+    (tmp_path / "index.html").write_text("<title>The Keaton Archive</title>")
     lib.s.web_dist = str(tmp_path)
     calls = []
     try:
         with TestClient(create_app(lib=lib, s=lib.s, before_reload=lambda: calls.append(1))) as c:
-            assert "<title>vidsearch</title>" in c.get("/").text
+            assert "<title>The Keaton Archive</title>" in c.get("/").text
             assert c.get("/api/library").json()["films"]
             assert c.post("/api/reload").json() == {"films": 2} and calls == [1]
     finally:

@@ -227,14 +227,32 @@ async function sendJson(method: 'POST' | 'DELETE', path: string, body: unknown, 
 export type UploadsMode = 'off' | 'device' | 'account'
 const UPLOADS_MODES: readonly UploadsMode[] = ['off', 'device', 'account']
 
-export interface Archive { films: Film[]; uploads: UploadsMode }
+/** What the archive and one of its items are called (`The Traffic Archive`, `clip`); each collection's API says. */
+export interface Identity { title: string; noun: string; nounPlural: string }
+
+/**
+ * Until the API answers: this build's VITE_ARCHIVE_TITLE, else the page's own title, which the API rewrites to its
+ * archive's when it serves the page. Also the identity of an API from before `archive` existed.
+ */
+export const FALLBACK_IDENTITY: Identity = { title: String(import.meta.env.VITE_ARCHIVE_TITLE || document.title), noun: 'film', nounPlural: 'films' }
+
+export interface Archive { films: Film[]; uploads: UploadsMode; identity: Identity }
+
+function parseIdentity(v: unknown): Identity {
+  const a = obj(v, 'library.archive')
+  return { title: str(a.title, 'archive.title'), noun: str(a.noun, 'archive.noun'), nounPlural: str(a.noun_plural, 'archive.noun_plural') }
+}
 
 export async function fetchLibrary(signal: AbortSignal): Promise<Archive> {
   const body = obj(await getJson(api('/api/library'), LIBRARY_RETRY, signal), 'library')
   // An API from before `uploads` existed offered sign-in whenever it had Auth0.
   const mode = body.uploads === undefined ? 'account' : str(obj(body.uploads, 'library.uploads').mode, 'uploads.mode')
   if (!UPLOADS_MODES.includes(mode as UploadsMode)) throw new Error(`uploads.mode: unknown mode ${mode}`)
-  return { films: arr(body.films, 'library.films').map(parseFilm), uploads: mode as UploadsMode }
+  return {
+    films: arr(body.films, 'library.films').map(parseFilm),
+    uploads: mode as UploadsMode,
+    identity: body.archive === undefined ? FALLBACK_IDENTITY : parseIdentity(body.archive),
+  }
 }
 
 export async function runSearch(query: string, signal: AbortSignal): Promise<Extract<Search, { status: 'ready' }>> {
