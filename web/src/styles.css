@@ -90,6 +90,38 @@ canvas { display: block; touch-action: none; }
 .pill-clear svg { width: 13px; height: 13px; stroke: var(--muted); stroke-width: 1.6; stroke-linecap: round; }
 .pill-clear:hover svg { stroke: var(--text); }
 
+/* Voice search: the transcript is drawn over the (hidden) input so heard-so-far text can be muted mid-sentence. */
+.pill-field { position: relative; flex: 1; min-width: 0; display: flex; align-self: stretch; }
+.pill input.hearing { color: transparent; caret-color: transparent; }
+.pill input.hearing::placeholder { color: transparent; }
+/* Left-aligned while it fits; once longer than the field, its end stays in view. */
+.pill-transcript {
+  position: absolute; inset: 0; display: flex; justify-content: flex-end; align-items: center;
+  overflow: hidden; pointer-events: none; font-size: 22px; white-space: nowrap;
+}
+.pill-transcript > span { flex: none; min-width: 100%; }
+.pill-transcript .partial { color: var(--muted); }
+.pill-transcript .hint { color: var(--faint); }
+.pill-mic {
+  --level: 0;
+  flex: none; position: relative; display: grid; place-items: center; width: 32px; height: 32px; margin-right: -6px; padding: 0;
+  background: none; border: 1px solid transparent; border-radius: 50%; cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+.pill-mic svg { width: 17px; height: 17px; fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linecap: round; }
+.pill-mic:hover:not(:disabled) svg { stroke: var(--text); }
+.pill-mic:disabled { cursor: default; opacity: 0.4; }
+.pill-mic:is(.requesting, .connecting, .listening, .finishing) { border-color: rgba(201, 160, 240, 0.4); }
+.pill-mic:is(.requesting, .connecting, .listening, .finishing) svg { stroke: var(--lilac); }
+.pill-mic.error svg { stroke: var(--error); }
+/* The live level: a lilac ring that swells and brightens with the microphone's loudness. */
+.pill-mic::after {
+  content: ''; position: absolute; inset: -1px; border-radius: 50%; border: 1px solid var(--lilac); pointer-events: none;
+  opacity: 0; transform: scale(calc(1 + var(--level) * 0.4)); transition: transform 0.12s ease-out, opacity 0.2s ease;
+}
+.pill-mic.listening::after { opacity: calc(0.2 + var(--level) * 0.8); }
+@media (prefers-reduced-motion: reduce) { .pill-mic::after { transition: none; } }
+
 .hover { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
 .hover > * { position: absolute; left: 0; top: 0; }
 .connector.vertical { margin-left: -1px; border-left: 2px dotted rgba(255, 255, 255, 0.7); }

@@ -8,6 +8,7 @@ import { Loader, useElapsed } from './Loader'
 import { Masthead } from './Masthead'
 import { Scene, type AnchorSink, type FilmFocus, type FrameHit, type ScreenBox } from './Scene'
 import { useUploads } from './uploads'
+import { useVoice, voiceActive, type Ending } from './voice'
 
 /** Who chose the frame the hover card shows: the pointer, or the arrow keys stepping through results. */
 type Pick = { by: 'pointer'; hit: FrameHit | null } | { by: 'keys'; index: number }
@@ -45,6 +46,7 @@ export function App() {
   const viewer = uploadsMode === 'device' ? device : session.status === 'signed-in' ? session.viewer.sub : null
   const [focus, setFocus] = useState<FilmFocus | null>(null)
   const [identity, setIdentity] = useState(FALLBACK_IDENTITY)
+  const [voice, setVoice] = useState(false)
   useEffect(() => { document.title = identity.title }, [identity.title])
   /** The viewer the library was last fetched for. */
   const loadedFor = useRef(viewer)
@@ -64,6 +66,7 @@ export function App() {
       loadedFor.current = archive.uploads === 'device' ? id : viewer
       setUploadsMode(archive.uploads)
       setIdentity(archive.identity)
+      setVoice(archive.voice)
       setDevice(id)
       setLibrary(libraryLoaded(archive.films))
     }
@@ -167,7 +170,7 @@ export function App() {
       {ready && uploadsMode && <AccountCorner mode={uploadsMode} noun={identity.noun} uploads={uploads} films={films} onLibraryChanged={onLibraryChanged} onDeviceNeeded={ensureDevice} onShowFilm={showFilm} />}
       <Loader library={library} onRetry={retryLibrary} />
       {hover.kind === 'frame' && <HoverCard hover={hover} film={films.find((f) => f.id === hover.filmId)} sink={anchorSink} />}
-      <SearchPill status={pillStatus(search, focusIndex)} disabled={!ready} onSubmit={submit} />
+      <SearchPill status={pillStatus(search, focusIndex)} disabled={!ready} voice={voice} onSubmit={submit} />
     </>
   )
 }
@@ -294,35 +297,87 @@ function pillStatus(search: Search, focusIndex: number): PillStatus {
   return { kind: 'none' }
 }
 
-function SearchPill({ status, disabled, onSubmit }: { status: PillStatus; disabled: boolean; onSubmit: (query: string) => void }) {
+function SearchPill({ status, disabled, voice, onSubmit }: { status: PillStatus; disabled: boolean; voice: boolean; onSubmit: (query: string) => void }) {
   const [text, setText] = useState('')
   const input = useRef<HTMLInputElement>(null)
+  const mic = useRef<HTMLButtonElement>(null)
   const busyFor = useElapsed(status.kind === 'busy' ? status.since : null)
   useEffect(() => { if (!disabled) input.current?.focus() }, [disabled])
+  const onHeard = useCallback((heard: string, ending: Ending) => {
+    const el = input.current
+    if (heard) {
+      setText(heard)
+      if (ending === 'auto') onSubmit(heard)
+    }
+    // After React writes the value: caret and scroll at the end, so a long query shows its last words.
+    requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(el.value.length, el.value.length); if (el) el.scrollLeft = el.scrollWidth })
+  }, [onSubmit])
+  const v = useVoice(mic, onHeard)
+  const active = voiceActive(v.state)
+  const { stop } = v
+  useEffect(() => {
+    if (!active) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); stop() } }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [active, stop])
+  const heard = v.state.kind === 'listening' || v.state.kind === 'finishing' ? v.state : null
+  const hint = v.state.kind === 'requesting' ? 'allow the microphone…' : v.state.kind === 'connecting' ? 'connecting…' : 'listening…'
   return (
-    <form className="pill" onSubmit={(e) => { e.preventDefault(); onSubmit(text) }}>
+    <form className="pill" onSubmit={(e) => { e.preventDefault(); if (active) stop(); else onSubmit(text) }}>
       <svg className="pill-icon" viewBox="0 0 16 16" aria-hidden="true">
         <circle cx="6.75" cy="6.75" r="4.75" />
         <path d="M10.4 10.4 14 14" />
       </svg>
-      <input
-        ref={input}
-        disabled={disabled}
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        placeholder={disabled ? 'waiting for the archive…' : 'search the archive'}
-        aria-label="Search"
-        spellCheck={false}
-      />
+      <div className="pill-field">
+        <input
+          ref={input}
+          className={active ? 'hearing' : undefined}
+          disabled={disabled}
+          value={text}
+          onChange={(e) => { v.cancel(); v.dismiss(); setText(e.target.value) }}
+          placeholder={disabled ? 'waiting for the archive…' : 'search the archive'}
+          aria-label="Search"
+          spellCheck={false}
+        />
+        {active && (
+          <div className="pill-transcript" aria-live="polite">
+            {heard && (heard.committed || heard.partial)
+              ? <span>{heard.committed}{heard.committed && heard.partial ? ' ' : ''}<span className="partial">{heard.partial}</span></span>
+              : <span className="hint">{hint}</span>}
+          </div>
+        )}
+      </div>
       <span className="pill-status" aria-live="polite">
-        {status.kind === 'busy' && busyFor > WAKING_AFTER_MS && <span className="pill-waking">waking up…</span>}
-        {status.kind === 'busy' && <span className="spinner" role="status" aria-label="searching" />}
-        {status.kind === 'error' && <span className="pill-error" title={status.message}>{status.message}</span>}
-        {status.kind === 'count' && <span className="pill-count">{status.text}</span>}
+        {v.state.kind === 'error' && <span className="pill-error" title={v.state.detail}>{v.state.message}</span>}
+        {(v.state.kind === 'connecting' || v.state.kind === 'finishing') && <span className="spinner" role="status" aria-label={v.state.kind} />}
+        {v.state.kind === 'idle' && <>
+          {status.kind === 'busy' && busyFor > WAKING_AFTER_MS && <span className="pill-waking">waking up…</span>}
+          {status.kind === 'busy' && <span className="spinner" role="status" aria-label="searching" />}
+          {status.kind === 'error' && <span className="pill-error" title={status.message}>{status.message}</span>}
+          {status.kind === 'count' && <span className="pill-count">{status.text}</span>}
+        </>}
       </span>
-      {text && (
+      {text && !active && (
         <button type="button" className="pill-clear" aria-label="Clear search" onClick={() => { setText(''); onSubmit(''); input.current?.focus() }}>
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+        </button>
+      )}
+      {voice && (
+        <button
+          type="button"
+          ref={mic}
+          className={`pill-mic ${v.state.kind}`}
+          disabled={disabled}
+          aria-label={active ? 'Stop listening' : 'Search by voice'}
+          aria-pressed={active}
+          title={active ? 'stop listening (Esc)' : 'search by voice'}
+          onClick={() => (active ? stop() : v.start())}
+        >
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <rect x="5.5" y="1.75" width="5" height="8" rx="2.5" />
+            <path d="M3.25 7.75a4.75 4.75 0 0 0 9.5 0M8 12.5v1.75" />
+          </svg>
         </button>
       )}
     </form>

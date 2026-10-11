@@ -7,6 +7,16 @@ through results. The archive's title and what it calls an item (`clip`) come fro
 `VITE_ARCHIVE_TITLE`, else the page's `<title>` (`The Traffic Archive` in `index.html`; the API rewrites it to its own
 when it serves the build).
 
+When the API reports `voice: {available: true}` in `/api/library`, the pill has a mic (`src/voice.ts`). Click it, allow
+the microphone, and the words appear in the field as they are heard (still-changing words muted); when you stop
+talking, ElevenLabs commits the transcript and the search runs. Click again or press Esc to stop early and keep the
+text to edit; typing cancels listening. The session is a small state machine (`idle`, `requesting`, `connecting`,
+`listening`, `finishing`, `error`); a lilac ring swells with the microphone's loudness while listening, and errors
+(microphone blocked, no microphone, voice limit reached, voice unavailable) show in the pill. An AudioWorklet
+downsamples the mic to 16 kHz PCM, which goes straight to ElevenLabs with a single-use token from `/api/voice/token`.
+`node scripts/verify-voice.mjs <wav> "<its words>" <outDir>` checks all of it in headless Chromium with a fake
+microphone playing the WAV (`BASE_URL` as for verify).
+
 The API may be cold (it scales to zero): the library request retries transient failures (network errors, 5xx) with
 backoff for up to 60 s behind a centred loader before offering a retry button, searches retry twice, and each atlas
 page retries three times before its strip is skipped.

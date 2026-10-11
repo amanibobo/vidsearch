@@ -77,7 +77,8 @@ Each chunk sends up to 4 frames from one shot (long shots are split into 12 s ch
 
 | Route | Returns |
 |---|---|
-| `GET /api/library` | clips (`films`) the caller can see: title, duration, `n_frames`, `sample_fps`, `shots`, `atlas` layout + `urls`, `video_url`, `owner_is_you`. Also `uploads`: `{mode, limits}`, where `mode` is `off`, `device` or `account` (below) |
+| `GET /api/library` | clips (`films`) the caller can see: title, duration, `n_frames`, `sample_fps`, `shots`, `atlas` layout + `urls`, `video_url`, `owner_is_you`. Also `uploads`: `{mode, limits}`, where `mode` is `off`, `device` or `account` (below), and `voice`: `{available}` (voice search, below) |
+| `GET /api/voice/token` | `{token, expires_in}`: a single-use ElevenLabs realtime speech-to-text token. 503 without a key, 429 over a limit, 502 when ElevenLabs fails |
 | `GET /api/search?q=cyclist+crossing+at+night&k=24` | ranked moments (below). Optional `films=id1,id2`, `gap=` (sec), `use=frame,window,caption` |
 | `GET /api/heatmap?q=...` | per visible film, base64 `uint8` per sampled frame (0–255 relevance) |
 | `GET /api/video/{id}` | source video with Range support, so `<video>` can seek |
@@ -181,6 +182,23 @@ protected only by its id: the title's slug plus 12 random hex characters (48 bit
 `my-commute-3fa9c1d2e4b7`. Anyone who learns the id, say from a shared frame URL, can fetch that
 film's frames and video, but can't list, search or delete it. Signed media URLs would close
 this if it matters later.
+
+### Voice search
+
+With `ELEVENLABS_API_KEY` set, `/api/library` reports `voice: {available: true}` and the search pill shows a mic.
+The browser asks `GET /api/voice/token` for a single-use token (15 minutes, one session), then streams 16 kHz PCM
+straight to ElevenLabs' realtime speech-to-text (`scribe_v2_realtime`, VAD commits), so the key never leaves the
+server. Each token spends the account's credits, so minting is limited in memory with sliding windows, and a refusal
+is a 429 naming the limit:
+
+| Limit | Default | Env |
+|---|---|---|
+| per browser id or account, per hour | 20 | `VS_VOICE_PER_USER_PER_HOUR` |
+| per client IP, per hour | 20 | `VS_VOICE_PER_IP_PER_HOUR` |
+| across everyone, per day | 200 | `VS_VOICE_GLOBAL_PER_DAY` |
+
+The client IP and its hashing are the uploads' (`VS_CLIENT_IP_HEADER`, `VS_IP_SALT`). The browser also stops listening
+after 30 s.
 
 ### Modal
 
@@ -327,7 +345,8 @@ on generated clips, so they run in ~15 s without downloading weights. They cover
 captions with resume, fused search, de-dupe, the heatmap and every API route.
 `tests/test_uploads.py` signs tokens with a throwaway RSA key and covers auth, browser ids, private
 visibility, the per-user, per-IP and global limits, size limits, chunked uploads, cancel, job
-failures, the timed-out job cleanup and delete.
+failures, the timed-out job cleanup and delete. `tests/test_voice.py` covers voice tokens with a stubbed minter
+and a stubbed ElevenLabs: the key never in a response or a log, 503 without a key, and the three limits.
 
 ## Next steps
 
@@ -351,8 +370,9 @@ vidsearch/
   embed.py     SigLIP 2 (open_clip) and sentence-transformer wrappers
   library.py   loads all clips, exact numpy search, fused search, heatmap
   server.py    FastAPI app
+  voice.py     ElevenLabs voice search tokens and their rate limits
   __main__.py  CLI
-tests/test_pipeline.py, tests/test_uploads.py, tests/test_collections.py
+tests/test_pipeline.py, tests/test_uploads.py, tests/test_collections.py, tests/test_voice.py
 modal_app.py   Modal deployment: web class, GPU job function, admin add_film
 web/           frontend (see web/README.md)
 ```
