@@ -92,6 +92,9 @@ class Settings:
     caption_model: str = field(default_factory=lambda: _env("VS_CAPTION_MODEL", "gpt-4o-mini"))
     caption_api_key: str = field(default_factory=lambda: _env("VS_CAPTION_API_KEY", ""))
 
+    # Ingested videos are re-encoded to H.264 MP4 at most this wide (see jobs.normalize_video).
+    max_video_width: int = field(default_factory=lambda: int(_env("VS_MAX_VIDEO_WIDTH", "1280")))
+
     # Built frontend (web/dist) to serve at /, so one server hosts API, media and app. "" = API only.
     web_dist: str = field(default_factory=lambda: _env("VS_WEB_DIST", ""))
 

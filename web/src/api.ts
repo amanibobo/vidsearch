@@ -283,7 +283,7 @@ export type JobState = 'uploading' | 'queued' | 'processing' | 'done' | 'failed'
 const JOB_STATES: readonly JobState[] = ['uploading', 'queued', 'processing', 'done', 'failed']
 
 /** The pipeline's stages in the order a job passes them; `downloading` only for URL uploads. */
-export const STAGES = ['downloading', 'probing', 'detecting shots', 'sampling frames', 'building atlas', 'embedding', 'captioning'] as const
+export const STAGES = ['downloading', 'probing', 'converting', 'detecting shots', 'sampling frames', 'building atlas', 'embedding', 'captioning'] as const
 
 export interface Job {
   id: JobId

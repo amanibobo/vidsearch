@@ -23,7 +23,7 @@ export const stepsFor = (source: Source): readonly string[] =>
 
 /** Each step's share of the journey, roughly its share of the wall time for a 30 s clip (captioning calls a remote model per shot). */
 const WEIGHT: Record<string, number> = {
-  uploading: 20, downloading: 20, probing: 2, 'detecting shots': 8, 'sampling frames': 8, 'building atlas': 4, embedding: 18, captioning: 40,
+  uploading: 20, downloading: 20, probing: 2, converting: 8, 'detecting shots': 8, 'sampling frames': 8, 'building atlas': 4, embedding: 18, captioning: 40,
 }
 
 /** Journey progress with `fraction` of `step` done. */
