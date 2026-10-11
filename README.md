@@ -272,6 +272,8 @@ A search result:
 }
 ```
 
+Bucket CORS must allow `GET`/`HEAD` from any origin (`AllowedOrigins: ["*"]`, `AllowedHeaders: ["Range"]`, exposing `Content-Length, Content-Range, Accept-Ranges, ETag`). Thumbnail textures are fetched in CORS mode, and the API's 302 to R2 is a cross-origin redirect, so the browser sends `Origin: null`; listing the site's origin isn't enough. Reads still need a valid presigned signature.
+
 ## Frontend
 
 `web/` is a Vite + React + react-three-fiber app that draws the library as filmstrips and searches it.
