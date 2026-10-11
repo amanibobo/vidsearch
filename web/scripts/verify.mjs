@@ -1,11 +1,14 @@
 // Drives the running dev server in headless Chromium at 1920x1080: screenshots, the archive title and loaders (slow,
 // failing and cold API; atlas progress), atlas pixel checks on plane slices and lifted cards, hover-card placement, frame
 // still and video seek, search states and retries, camera travel, fps, and the overview at a 3-film library. Then
-// accounts and uploads: sign-in UI, quota, client-side refusals, a chunked upload with an injected part failure, job
-// stages, the new private strip and camera move, search and privacy across dev users, URL errors, delete, expired sessions.
+// uploads, in whichever mode the API advertises: quota, client-side refusals, a chunked upload with an injected part
+// failure, job stages, the new private strip and camera move, search and privacy across identities, URL errors, delete.
+// Device mode (VS_ANON_UPLOADS=1, no auth env on the dev server) adds the browser-identity corner, cancel giving the slot
+// back and the per-IP cap; account mode (VS_DEV_AUTH=1 and VITE_DEV_AUTH=tester) adds sign-in and expired sessions.
 // Usage: node scripts/verify.mjs <outDir> <label>   (env BASE_URL, default http://localhost:5199; CHROMIUM to override the binary;
-// ONLY=archive or ONLY=account runs one half). The account half needs the API on VS_DEV_AUTH=1 and the dev server on
-// VITE_DEV_AUTH=tester, and makes its 30 s upload clip from ../videos/Cops.mp4 with ffmpeg.
+// ONLY=archive or ONLY=uploads runs one half; ONLY=prod checks a production build served by `vite preview` instead).
+// The upload half makes its 30 s clip from ../videos/Cops.mp4 with ffmpeg and fills the API's per-IP quota, so give it
+// a freshly started API (job records and counts live in its memory).
 import { chromium } from 'playwright-core'
 import { spawnSync } from 'node:child_process'
 import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, statSync, writeFileSync } from 'node:fs'
@@ -24,6 +27,8 @@ const ARCHIVE_TITLE = process.env.VITE_ARCHIVE_TITLE || 'The Keaton Archive'
 const WAITING_PLACEHOLDER = 'waiting for the archive…'
 const ONLY = process.env.ONLY ?? ''
 const DEV_USER = 'tester'
+const DEVICE_NOTE = 'uploads are tied to this browser; clearing site data loses access'
+const DEVICE_TOKEN = /^device:[0-9a-f]{32}$/
 const SOURCE_FILM = new URL('../../videos/Cops.mp4', import.meta.url).pathname
 const POLL = 1500
 
@@ -165,8 +170,11 @@ async function measureFps(page) {
 
 const browser = await chromium.launch({ executablePath: findChromium(), headless: true, args: (process.env.CHROMIUM_ARGS ?? '').split(' ').filter(Boolean) })
 try {
-  if (ONLY !== 'account') await archiveChecks()
-  if (ONLY !== 'archive') await accountChecks()
+  if (ONLY === 'prod') await prodChecks()
+  else {
+    if (ONLY !== 'uploads') await archiveChecks()
+    if (ONLY !== 'archive') await uploadChecks()
+  }
 } finally {
   await browser.close()
 }
@@ -543,57 +551,63 @@ function uploadFixtures() {
   return { clip, oversize }
 }
 
-async function accountChecks() {
-  const run = Date.now().toString(36)
-  const me = `tester-${run}`, other = `other-${run}`
-  const { clip, oversize } = uploadFixtures()
-  const clipBytes = statSync(clip).size
-  const contexts = []
+async function uploadChecks() {
+  const mode = (await (await fetch(new URL('/api/library', BASE))).json()).uploads?.mode
+  console.log(`uploads mode from /api/library: ${mode}`)
+  if (mode === 'device') return deviceChecks()
+  if (mode === 'account') return accountChecks()
+  check(false, `the API offers uploads (mode "${mode}"); start it with VS_ANON_UPLOADS=1 or VS_DEV_AUTH=1`)
+}
 
-  /** A fresh browser profile signed in as `user` through dev auth ('' = signed out), on the loaded archive. */
-  const open = async (user, prepare) => {
-    const ctx = await browser.newContext({ viewport: VIEWPORT })
-    contexts.push(ctx)
-    await ctx.addInitScript((u) => localStorage.setItem('vidsearch.dev-user', u), user)
-    const page = await ctx.newPage()
-    page.on('pageerror', (e) => failures.push(`pageerror (${user || 'signed out'}): ${e.message}`))
-    page.on('console', (m) => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) console.log(`console.error (${user || 'signed out'}):`, m.text()) })
-    if (prepare) await prepare(page)
-    await page.goto(BASE)
-    await page.waitForFunction(() => window.__vidsearch?.settled())
-    await ready(page)
-    return page
-  }
-  const apiAs = (page, user, path) => page.evaluate(async ([u, p]) => {
-    const r = await fetch(p, { headers: u ? { Authorization: `Bearer dev:${u}` } : {} })
+/** A fresh browser profile on the loaded archive. `devUser` picks the dev-auth user ('' = signed out). */
+async function openPage(contexts, name, { devUser, prepare } = {}) {
+  const ctx = await browser.newContext({ viewport: VIEWPORT })
+  contexts.push(ctx)
+  if (devUser !== undefined) await ctx.addInitScript((u) => localStorage.setItem('vidsearch.dev-user', u), devUser)
+  const page = await ctx.newPage()
+  page.on('pageerror', (e) => failures.push(`pageerror (${name}): ${e.message}`))
+  page.on('console', (m) => { if (m.type() === 'error' && !/Failed to load resource/.test(m.text())) console.log(`console.error (${name}):`, m.text()) })
+  if (prepare) await prepare(page)
+  await page.goto(BASE)
+  await page.waitForFunction(() => window.__vidsearch?.settled())
+  await ready(page)
+  return page
+}
+
+/** One API call from the page with `bearer` (null = anonymous); { status, body }. */
+function apiAs(page, bearer, path, { method = 'GET', json } = {}) {
+  return page.evaluate(async ([b, p, m, j]) => {
+    const headers = { ...(b ? { Authorization: `Bearer ${b}` } : {}), ...(j ? { 'Content-Type': 'application/json' } : {}) }
+    const r = await fetch(p, { method: m, headers, body: j ? JSON.stringify(j) : undefined })
     return { status: r.status, body: await r.json().catch(() => null) }
-  }, [user, path])
-  const menu = async (page, item) => {
-    if (!(await page.$('.menu'))) await page.click('.account-avatar')
-    await page.click(`.menu button:text-is("${item}")`)
-  }
-  const uiSearch = async (page, q) => {
-    const res = page.waitForResponse((r) => r.url().includes('/api/search?'))
-    await page.fill(INPUT, q)
-    await page.press(INPUT, 'Enter')
-    const r = await res
-    return { auth: (await r.request().allHeaders()).authorization ?? null, body: await r.json() }
-  }
+  }, [bearer, path, method, json ?? null])
+}
 
-  const out = await open('')
-  await out.waitForTimeout(800)
-  await shot(out, '1-signed-out')
-  check(await out.textContent('.account-signin') === 'sign in' && !(await out.$('.account-avatar')) && !(await out.$('.panel')) && !(await out.$('.chip')),
-    'signed out: top-right shows "sign in", no avatar, no upload')
-  await out.click('.account-signin')
-  await out.click('.account-avatar')
-  check(await out.textContent('.menu-who') === DEV_USER, `"sign in" with dev auth signs in as VITE_DEV_AUTH (${await out.textContent('.menu-who')})`)
+async function uiSearch(page, q) {
+  const res = page.waitForResponse((r) => r.url().includes('/api/search?'))
+  await page.fill(INPUT, q)
+  await page.press(INPUT, 'Enter')
+  const r = await res
+  return { auth: (await r.request().allHeaders()).authorization ?? null, body: await r.json() }
+}
 
-  const page = await open(me)
-  await page.click('.account-avatar')
-  const items = await page.$$eval('.menu button', (bs) => bs.map((b) => b.textContent))
-  check(JSON.stringify(items) === JSON.stringify(['upload', 'my uploads', 'sign out']), `signed in: the avatar menu lists ${JSON.stringify(items)}`)
-  await menu(page, 'upload')
+async function clickIfShown(page, selector) {
+  const el = await page.$(selector)
+  if (el) await el.click()
+}
+
+async function deviceToken(page) {
+  const id = await page.evaluate(() => localStorage.getItem('vidsearch.device'))
+  return id && `device:${id}`
+}
+
+/**
+ * The upload journey both modes share, for the identity `me` ({ bearer, openPanel(page, 'upload' | 'my uploads'), note,
+ * afterUpload?(page, filmId) }) on `page`, whose upload panel is already open on a fresh quota. `openOther()` returns
+ * another identity's page and bearer, opened after the film exists. Returns the film id, deleted again by the end.
+ */
+async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
+  const clipBytes = statSync(clip).size
   await page.waitForSelector('.quota:text-matches("of 3")')
   const quota0 = await page.textContent('.quota')
   check(quota0 === '3 of 3 uploads left today', `upload panel shows "${quota0}"`)
@@ -662,11 +676,12 @@ async function accountChecks() {
   const doneText = await page.textContent('.job-done').catch(() => null)
   const finalStages = await page.$$eval('.stages li', (lis) => lis.map((li) => `${li.querySelector('.stage-name').textContent}:${li.dataset.state}`))
   console.log('stages seen while polling:', [...seen].join(' → '))
-  check(!!doneText && finalStages.every((s) => s.endsWith(':done')) && seen.size >= 3 && seen.has('embedding'),
-    `the job's stages advance to done: "${doneText}" (${finalStages.join(', ')})`)
+  // A warm model embeds a 30 s clip between two 1.5 s polls, so which stages the panel catches live varies.
+  check(!!doneText && finalStages.every((s) => s.endsWith(':done')) && seen.size >= 2,
+    `the job's stages advance live (${seen.size} seen) to done: "${doneText}" (${finalStages.join(', ')})`)
   check(!(await page.$('.chip')), 'the status chip goes away once nothing is running')
 
-  const jobs = (await apiAs(page, me, '/api/jobs')).body
+  const jobs = (await apiAs(page, me.bearer, '/api/jobs')).body
   const job = jobs.jobs.find((j) => j.title === title)
   const filmId = job?.film_id
   await page.waitForFunction((id) => !!window.__vidsearch.ownerMark(id), filmId, { timeout: 15000 }).catch(() => {})
@@ -679,37 +694,38 @@ async function accountChecks() {
   const markTone = mark && await tone(page, { x: mark.left, y: mark.top, width: Math.max(2, mark.right - mark.left), height: Math.max(2, mark.bottom - mark.top) })
   const stripMid = await page.evaluate(([id, n]) => window.__vidsearch.screenOf(id, Math.floor(n / 2)), [filmId, 30])
   await shot(page, '5-new-strip')
-  const lib = (await apiAs(page, me, '/api/library')).body.films
+  const lib = (await apiAs(page, me.bearer, '/api/library')).body.films
   const mine = lib.find((f) => f.id === filmId)
-  check(!!mine?.owner_is_you && lib.filter((f) => f.owner_is_you).length === 1, `the new film ${filmId} is in ${me}'s library, marked owner_is_you`)
+  check(!!mine?.owner_is_you && lib.filter((f) => f.owner_is_you).length === 1, `the new film ${filmId} is in ${me.bearer}'s library, marked owner_is_you`)
   check(!!mark && markTone.lilac > 0.5 * (mark.right - mark.left) * (mark.bottom - mark.top), `its strip carries the lilac ownership mark (${markTone?.lilac} lilac px in ${JSON.stringify(mark && { w: Math.round(mark.right - mark.left), h: Math.round(mark.bottom - mark.top) })})`)
   const others = await page.evaluate((ids) => ids.map((id) => window.__vidsearch.ownerMark(id)), lib.filter((f) => !f.owner_is_you).map((f) => f.id))
   check(others.every((m) => m === null), 'public films carry no ownership mark')
   check(viewAfter.dist < viewBefore.dist * 0.6 && !!stripMid && Math.abs(stripMid.x - VIEWPORT.width / 2) < 120 && Math.abs(stripMid.y - VIEWPORT.height / 2) < 160,
     `the camera eased to the new strip (dist ${viewBefore.dist.toFixed(1)} -> ${viewAfter.dist.toFixed(1)}; strip middle on screen at ${stripMid && `${stripMid.x.toFixed(0)},${stripMid.y.toFixed(0)}`})`)
 
-  const probe = (await apiAs(page, me, `/api/search?q=${encodeURIComponent('a man')}&k=3&films=${filmId}`)).body.results
+  const probe = (await apiAs(page, me.bearer, `/api/search?q=${encodeURIComponent('a man')}&k=3&films=${filmId}`)).body.results
   const query = probe[0]?.caption ?? 'a man'
   console.log(`searching for a moment of the clip: "${query}"`)
   const found = await uiSearch(page, query)
   const hit = found.body.results.find((r) => r.film_id === filmId)
-  check(found.auth === `Bearer dev:${me}` && !!hit && found.body.heatmap.films[filmId] !== undefined,
-    `${me}'s search finds a moment in the upload (rank ${hit?.rank}, ${hit && clock(hit.t)}), sending its bearer token`)
+  check(found.auth === `Bearer ${me.bearer}` && !!hit && found.body.heatmap.films[filmId] !== undefined,
+    `the uploader's search finds a moment in the upload (rank ${hit?.rank}, ${hit && clock(hit.t)}), sending its bearer token`)
+  if (me.afterUpload) await me.afterUpload(page, filmId)
 
-  const page2 = await open(other)
-  const lib2 = (await apiAs(page2, other, '/api/library')).body.films
-  const anon = (await apiAs(page2, null, '/api/library')).body.films
-  const found2 = await uiSearch(page2, query)
-  const job2 = await apiAs(page2, other, `/api/jobs/${job.id}`)
-  check(!lib2.some((f) => f.id === filmId) && !anon.some((f) => f.id === filmId) && !(await page2.evaluate((id) => window.__vidsearch.screenOf(id, 0), filmId)),
-    `another user (${other}) and anonymous visitors don't get the film in the library or on the plane`)
-  check(found2.auth === `Bearer dev:${other}` && found2.body.results.length > 0 && !found2.body.results.some((r) => r.film_id === filmId) && found2.body.heatmap.films[filmId] === undefined && job2.status === 403,
-    `another user's search for the same words returns ${found2.body.results.length} public results and none from the upload; its job is 403 to them`)
+  const other = await openOther()
+  const lib2 = (await apiAs(other.page, other.bearer, '/api/library')).body.films
+  const anon = (await apiAs(other.page, null, '/api/library')).body.films
+  const found2 = await uiSearch(other.page, query)
+  const job2 = await apiAs(other.page, other.bearer, `/api/jobs/${job.id}`)
+  check(!lib2.some((f) => f.id === filmId) && !anon.some((f) => f.id === filmId) && !(await other.page.evaluate((id) => window.__vidsearch.screenOf(id, 0), filmId)),
+    `another identity (${other.bearer}) and anonymous visitors don't get the film in the library or on the plane`)
+  check(found2.auth === `Bearer ${other.bearer}` && found2.body.results.length > 0 && !found2.body.results.some((r) => r.film_id === filmId) && found2.body.heatmap.films[filmId] === undefined && job2.status === 403,
+    `another identity's search for the same words returns ${found2.body.results.length} public results and none from the upload; its job is 403 to them`)
 
   await page.fill(INPUT, '')
   await page.press(INPUT, 'Enter')
-  await menu(page, 'upload')
-  await page.click('.upload-submit:text-is("upload another")')
+  await me.openPanel(page, 'upload')
+  await clickIfShown(page, '.upload-submit:text-is("upload another")')  // after a reload the panel opens on the form
   await page.fill('input[name=url]', 'not a link')
   await page.fill('input[name=title]', 'bad link')
   await page.click('.upload-submit')
@@ -720,26 +736,181 @@ async function accountChecks() {
   const quota1 = await page.textContent('.quota')
   check(quota1 === '2 of 3 uploads left today', `the remaining count follows /api/jobs: "${quota1}"`)
 
-  await menu(page, 'my uploads')
+  await me.openPanel(page, 'my uploads')
   const row = `.mine-list li[data-film="${filmId}"]`
   await page.waitForSelector(row)
   const rowText = { title: await page.textContent(`${row} .mine-title`), meta: await page.textContent(`${row} .mine-meta`) }
   check(rowText.title === title && /^ready · /.test(rowText.meta), `my uploads lists "${rowText.title}" as "${rowText.meta}"`)
+  const note = await page.textContent('.panel.mine .mine-note').catch(() => null)
+  check(note === me.note, `my uploads ${me.note ? `notes "${note}"` : 'has no browser note'}`)
   await shot(page, '6-my-uploads')
   await page.click(`${row} .mine-delete`)
   await page.click(`${row} .danger`)
   await page.waitForSelector(`${row} .mine-meta:text-matches("^deleted")`, { timeout: 15000 })
   await page.waitForFunction((id) => !window.__vidsearch.screenOf(id, 0), filmId, { timeout: 15000 }).catch(() => {})
-  const libAfter = (await apiAs(page, me, '/api/library')).body.films
+  const libAfter = (await apiAs(page, me.bearer, '/api/library')).body.films
   check(!libAfter.some((f) => f.id === filmId) && !(await page.evaluate((id) => window.__vidsearch.screenOf(id, 0), filmId)) && !(await page.$(`${row} .mine-delete`)),
     'delete (after confirming) removes the film from the API library and its strip from the plane')
+  return filmId
+}
+
+async function accountChecks() {
+  const run = Date.now().toString(36)
+  const me = `tester-${run}`, other = `other-${run}`
+  const fixtures = { ...uploadFixtures(), run }
+  const contexts = []
+  const menu = async (page, item) => {
+    if (!(await page.$('.menu'))) await page.click('.account-avatar')
+    await page.click(`.menu button:text-is("${item}")`)
+  }
+
+  const out = await openPage(contexts, 'signed out', { devUser: '' })
+  await out.waitForTimeout(800)
+  await shot(out, '1-signed-out')
+  check(await out.textContent('.account-signin') === 'sign in' && !(await out.$('.account-avatar')) && !(await out.$('.panel')) && !(await out.$('.chip')),
+    'signed out: top-right shows "sign in", no avatar, no upload')
+  await out.click('.account-signin')
+  await out.click('.account-avatar')
+  check(await out.textContent('.menu-who') === DEV_USER, `"sign in" with dev auth signs in as VITE_DEV_AUTH (${await out.textContent('.menu-who')})`)
+
+  const page = await openPage(contexts, me, { devUser: me })
+  await page.click('.account-avatar')
+  const items = await page.$$eval('.menu button', (bs) => bs.map((b) => b.textContent))
+  check(JSON.stringify(items) === JSON.stringify(['upload', 'my uploads', 'sign out']), `signed in: the avatar menu lists ${JSON.stringify(items)}`)
+  await menu(page, 'upload')
+  await uploadJourney(page, { bearer: `dev:${me}`, openPanel: menu, note: null },
+    async () => ({ page: await openPage(contexts, other, { devUser: other }), bearer: `dev:${other}` }), fixtures)
 
   let jobsCalls = 0
-  const expired = await open(me, (p) => p.route('**/api/jobs', (r) => { if (r.request().headers().authorization) jobsCalls++; return r.fulfill({ status: 401, json: { detail: 'invalid token: expired' } }) }))
+  const expired = await openPage(contexts, 'expired', { devUser: me, prepare: (p) => p.route('**/api/jobs', (r) => { if (r.request().headers().authorization) jobsCalls++; return r.fulfill({ status: 401, json: { detail: 'invalid token: expired' } }) }) })
   await expired.waitForSelector('.account-notice', { timeout: 10000 }).catch(() => {})
   const notice = await expired.textContent('.account-notice').catch(() => null)
   check(notice === 'your session expired; sign in again' && jobsCalls === 2 && await expired.isVisible('.account-signin'),
     `a 401 that survives one fresh-token retry (${jobsCalls} requests) signs the user out with "${notice}"`)
 
   for (const ctx of contexts) await ctx.close()
+}
+
+async function deviceChecks() {
+  const run = Date.now().toString(36)
+  const fixtures = { ...uploadFixtures(), run }
+  const contexts = []
+  const corner = (page, item) => page.click(`.account-bar button:text-is("${item}")`)
+  const openPanel = async (page, item) => {
+    if (!(await page.$(`.panel.${item === 'upload' ? 'upload' : 'mine'}`))) await corner(page, item)
+  }
+
+  const page = await openPage(contexts, 'browser A')
+  await page.waitForTimeout(800)
+  await shot(page, '1-corner')
+  const links = await page.$$eval('.account-bar button', (bs) => bs.map((b) => b.textContent))
+  check(JSON.stringify(links) === JSON.stringify(['upload', 'my uploads']) && !(await page.$('.account-avatar')) && !(await page.$('.account-signin')) && !(await page.$('.panel')),
+    `without sign-in the top-right offers ${JSON.stringify(links)}: no avatar, no sign in`)
+  check(await deviceToken(page) === null, 'merely visiting mints no browser id')
+  const jobsAuth = page.waitForRequest((r) => new URL(r.url()).pathname === '/api/jobs')
+  await corner(page, 'upload')
+  const bearer = await deviceToken(page)
+  const sent = (await (await jobsAuth).allHeaders()).authorization
+  check(DEVICE_TOKEN.test(bearer ?? '') && sent === `Bearer ${bearer}`, `opening upload mints this browser's id and sends it: ${sent}`)
+
+  const openOther = async () => {
+    const other = await openPage(contexts, 'browser B')
+    await corner(other, 'my uploads')
+    await other.waitForSelector('.panel.mine .job-note:text-is("nothing uploaded yet")', { timeout: 10000 }).catch(() => {})
+    const empty = await other.textContent('.panel.mine .job-note').catch(() => null)
+    const otherBearer = await deviceToken(other)
+    check(DEVICE_TOKEN.test(otherBearer ?? '') && otherBearer !== bearer && empty === 'nothing uploaded yet',
+      `a second browser (fresh storage) gets its own id and an empty "my uploads": "${empty}"`)
+    await other.click('.panel-close')
+    return { page: other, bearer: otherBearer }
+  }
+  const afterUpload = async (p, filmId) => {
+    const asked = []
+    // Finished requests only: StrictMode's mount, unmount, mount aborts the dev server's first library request.
+    const onRequest = (r) => { if (new URL(r.url()).pathname === '/api/library') asked.push(r.headers().authorization ?? null) }
+    p.on('requestfinished', onRequest)
+    await p.reload()
+    await p.waitForFunction(() => window.__vidsearch?.settled())
+    await ready(p)
+    p.off('requestfinished', onRequest)
+    const strip = await p.evaluate((id) => !!window.__vidsearch.screenOf(id, 0) && !!window.__vidsearch.ownerMark(id), filmId)
+    check(strip && JSON.stringify(asked) === JSON.stringify([null, `Bearer ${bearer}`]),
+      `after a reload this browser gets its strip back: the library is asked anonymously, then as the stored id (${JSON.stringify(asked)})`)
+  }
+  await uploadJourney(page, { bearer, openPanel, note: DEVICE_NOTE, afterUpload }, openOther, fixtures)
+
+  // Cancel mid-upload gives the day's upload back.
+  const used = async () => (await apiAs(page, bearer, '/api/jobs')).body.uploads_today
+  await openPanel(page, 'upload')
+  await clickIfShown(page, '.upload-submit:text-is("try again")')
+  await page.waitForSelector('.quota:text-matches("of 3")')
+  const quotaBefore = await page.textContent('.quota')
+  await page.route('**/api/uploads/*/parts/*', () => {})  // parts hang until the cancel aborts them
+  await page.setInputFiles('.drop input[type=file]', fixtures.clip)
+  await page.fill('input[name=title]', `cancel me ${run}`)
+  await page.click('.upload-submit')
+  await page.waitForSelector('.transfer-cancel')
+  await page.waitForTimeout(500)
+  const usedDuring = await used()
+  await shot(page, '7-cancelling')
+  await page.click('.transfer-cancel')
+  await page.waitForSelector('.panel.upload .upload-error:text-is("upload cancelled")', { timeout: 10000 })
+  await page.unroute('**/api/uploads/*/parts/*')
+  const usedAfter = await used()
+  const cancelled = (await apiAs(page, bearer, '/api/jobs')).body.jobs.find((j) => j.title === `cancel me ${run}`)
+  await page.click('.upload-submit:text-is("try again")')
+  await page.waitForSelector('.quota:text-matches("of 3")')
+  const quotaAfter = await page.textContent('.quota')
+  check(usedDuring === usedAfter + 1 && cancelled?.state === 'failed' && cancelled?.error === 'cancelled' && quotaAfter === quotaBefore,
+    `cancel mid-upload frees the slot: ${usedDuring} used while sending, ${usedAfter} after; the panel is back to "${quotaAfter}"`)
+
+  // Fill this network's daily uploads from other browser ids, then the panel shows the per-IP refusal.
+  const fillers = []
+  let full = null
+  for (let i = 0; i < 40 && !full; i++) {
+    const id = `device:${Array.from({ length: 32 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('')}`
+    const r = await apiAs(page, id, '/api/uploads', { method: 'POST', json: { title: 'filler', filename: 'f.mp4', size: 10 } })
+    if (r.status === 200) fillers.push([id, r.body.upload_id])
+    else full = r
+  }
+  console.log(`filled the per-IP quota with ${fillers.length} uploads: ${full && `${full.status} ${full.body?.detail}`}`)
+  await page.setInputFiles('.drop input[type=file]', fixtures.clip)
+  await page.fill('input[name=title]', `over the cap ${run}`)
+  await page.click('.upload-submit')
+  await page.waitForSelector('.panel.upload .upload-error', { timeout: 10000 })
+  const capText = await page.textContent('.panel.upload .upload-error')
+  await shot(page, '8-ip-cap')
+  check(full?.status === 429 && /^daily limit of \d+ uploads from this network reached; try again after 00:00 UTC$/.test(capText),
+    `with this network's uploads used up the panel says: "${capText}"`)
+  for (const [id, upload] of fillers) await apiAs(page, id, `/api/uploads/${upload}`, { method: 'DELETE' })
+
+  for (const ctx of contexts) await ctx.close()
+}
+
+/** A production build (`vite build`, served by `vite preview`) talking to the API at VITE_API_URL: no dev hooks here. */
+async function prodChecks() {
+  const ctx = await browser.newContext({ viewport: VIEWPORT })
+  const page = await ctx.newPage()
+  page.on('pageerror', (e) => failures.push(`pageerror (prod): ${e.message}`))
+  const api = new Set()
+  page.on('request', (r) => { if (r.url().includes('/api/')) api.add(new URL(r.url()).origin) })
+  await page.goto(BASE)
+  await page.waitForSelector('.account-bar', { timeout: 60000 })
+  const links = await page.$$eval('.account-bar button', (bs) => bs.map((b) => b.textContent))
+  check(JSON.stringify(links) === JSON.stringify(['upload', 'my uploads']) && !(await page.$('.account-signin')),
+    `prod build: the corner offers ${JSON.stringify(links)} and no sign in`)
+  const jobs = page.waitForRequest((r) => new URL(r.url()).pathname === '/api/jobs')
+  await page.click('.account-bar button:text-is("upload")')
+  const sent = (await (await jobs).allHeaders()).authorization
+  await page.waitForSelector('.quota:text-matches("of 3")', { timeout: 15000 }).catch(() => {})
+  const quota = await page.textContent('.quota').catch(() => null)
+  const bearer = await deviceToken(page)
+  check(DEVICE_TOKEN.test(bearer ?? '') && sent === `Bearer ${bearer}` && quota === '3 of 3 uploads left today',
+    `prod build: upload mints a browser id the API accepts (${sent}): "${quota}"`)
+  await page.click('.account-bar button:text-is("my uploads")')
+  const note = await page.textContent('.panel.mine .mine-note').catch(() => null)
+  check(note === DEVICE_NOTE, `prod build: my uploads notes "${note}"`)
+  await shot(page, 'prod-device')
+  console.log(`API origins called: ${[...api].join(', ')}`)
+  await ctx.close()
 }

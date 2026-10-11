@@ -9,8 +9,9 @@ A `queued` or `processing` job whose record hasn't changed for STALE_AFTER_S (it
 crash, a container lost, the GPU function's timeout) reads back as failed, "processing timed out".
 
 `uploading` exists only for browser uploads (the job is created when the upload starts, so the
-daily quota counts uploads at creation; `total` is then the number of parts). While processing,
-done/total count units of the current `stage`.
+daily quotas count uploads at creation; `total` is then the number of parts). Cancelling an upload
+fails it with error "cancelled" and gives its quota slots back. While processing, done/total count
+units of the current `stage`.
 
 The job body (`run_job`) runs in two places behind the `Runner` interface: a background thread
 here (`LocalRunner`), or a GPU function on Modal (see modal_app.py). Records live in a key-value
@@ -20,6 +21,7 @@ record; the API only reads it.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import math
 import secrets
@@ -32,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal, MutableMapping, Protocol
+from typing import Callable, Literal, MutableMapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
 import httpx
@@ -51,12 +53,14 @@ NEXT: dict[str, set[str]] = {
 # process_job's Modal timeout is 60 min, so a record untouched for 70 min has no live worker behind it
 # (the margin covers waiting for a GPU between queued and processing).
 STALE_AFTER_S = 70 * 60
+TIMED_OUT = "processing timed out"
+CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)
 class Job:
     id: str
-    owner: str | None          # Auth0 sub; None = admin job, film is public
+    owner: str | None          # Auth0 sub or device:<hex>; None = admin job, film is public
     title: str
     film_id: str
     source: Literal["file", "url"]
@@ -70,6 +74,7 @@ class Job:
     updated: float = field(default_factory=time.time)  # last state or progress write
     url: str | None = None     # source == "url"
     size: int | None = None    # source == "file": declared byte size
+    quota: tuple[str, ...] = ()  # the quota buckets this job holds a slot in; internal, never sent to clients
 
 
 def advance(job: Job, state: State, **changes) -> Job:
@@ -99,22 +104,51 @@ def new_job(owner: str | None, title: str, source: Literal["file", "url"], ext: 
                total=math.ceil(size / part_size) if size else 0)
 
 
-def utc_midnight(now: float) -> float:
-    d = datetime.fromtimestamp(now, timezone.utc)
-    return d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+@dataclass(frozen=True)
+class Quota:
+    """One daily limit: `key` names a bucket of the job ids that count against it today."""
+    key: str
+    limit: int
+    refusal: str  # the 429 message, naming the limit
+
+
+def _today(now: float) -> str:
+    return datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+
+
+def user_bucket(owner: str, now: float) -> str:
+    return f"quota:{_today(now)}:user:{owner}"
+
+
+def hash_ip(ip: str, salt: str) -> str:
+    return hashlib.sha256(f"{salt}\0{ip}".encode()).hexdigest()
+
+
+def upload_quotas(s: Settings, owner: str, ip_hash: str, now: float) -> list[Quota]:
+    """Every limit a new upload counts against, most specific first, so a refusal names the nearest one."""
+    day, retry = _today(now), "try again after 00:00 UTC"
+    return [
+        Quota(user_bucket(owner, now), s.uploads_per_day,
+              f"daily limit of {s.uploads_per_day} uploads reached; {retry}"),
+        Quota(f"quota:{day}:ip:{ip_hash}", s.uploads_per_ip_per_day,
+              f"daily limit of {s.uploads_per_ip_per_day} uploads from this network reached; {retry}"),
+        Quota(f"quota:{day}:all", s.uploads_global_per_day,
+              f"the archive's daily limit of {s.uploads_global_per_day} uploads across everyone is reached; {retry}"),
+    ]
 
 
 class JobStore:
     """Job records in a key-value mapping (dict or modal.Dict).
 
-        "job:<id>"     -> the job as a dict
-        "owner:<sub>"  -> that user's job ids, oldest first
+        "job:<id>"               -> the job as a dict
+        "owner:<sub>"            -> that user's job ids, oldest first
+        "quota:<utc day>:<who>"  -> ids of that day's uploads counting against one limit (see upload_quotas)
     """
 
     def __init__(self, kv: MutableMapping | None = None, stale_after: float = STALE_AFTER_S):
         self.kv = {} if kv is None else kv
         self.stale_after = stale_after
-        self._create_lock = threading.Lock()
+        self._quota_lock = threading.Lock()
 
     def get(self, job_id: str) -> Job | None:
         rec = self.kv.get(f"job:{job_id}")
@@ -122,7 +156,7 @@ class JobStore:
             return None
         job = Job(**{"updated": rec["created"], **rec})  # records written before `updated` existed
         if job.state in ("queued", "processing") and time.time() - job.updated > self.stale_after:
-            return advance(job, "failed", error="processing timed out")
+            return advance(job, "failed", error=TIMED_OUT)
         return job
 
     def put(self, job: Job) -> None:
@@ -133,21 +167,36 @@ class JobStore:
         ids = self.kv.get(f"owner:{owner}", [])[-limit:]
         return [j for j in (self.get(i) for i in reversed(ids)) if j]
 
-    def created_today(self, owner: str) -> int:
-        start = utc_midnight(time.time())
-        return sum(j.created >= start for j in self.for_owner(owner))
+    def count(self, bucket: str) -> int:
+        return len(self.kv.get(bucket, []))
 
-    def create(self, job: Job, daily_limit: int) -> None:
-        """Record a new job, counting it against the owner's uploads for the UTC day.
-        The check and the write share a lock; on Modal the web class runs one container, so this
-        is the only writer of the owner index."""
-        with self._create_lock:
-            if job.owner and self.created_today(job.owner) >= daily_limit:
-                raise QuotaExceeded(f"daily limit of {daily_limit} uploads reached; try again after 00:00 UTC")
+    def create(self, job: Job, quotas: Sequence[Quota]) -> Job:
+        """Record a new job, taking a slot in every quota, or raise QuotaExceeded naming the first one full.
+        Checks and writes share a lock; on Modal the web class runs one container, so this is the only
+        writer of the owner index and the quota buckets."""
+        with self._quota_lock:
+            for q in quotas:
+                if self.count(q.key) >= q.limit:
+                    raise QuotaExceeded(q.refusal)
+            job = replace(job, quota=tuple(q.key for q in quotas))
             self.put(job)
-            if job.owner:
-                key = f"owner:{job.owner}"
+            for key in (*job.quota, *([f"owner:{job.owner}"] if job.owner else [])):
                 self.kv[key] = [*self.kv.get(key, []), job.id]
+            return job
+
+    def cancel(self, job_id: str) -> Job:
+        """uploading -> failed "cancelled", giving its quota slots back. Safe to repeat, also after a crash
+        between the two writes. ValueError when the upload already finished."""
+        with self._quota_lock:
+            job = self.get(job_id)
+            if not (job.state == "failed" and job.error == CANCELLED):
+                if job.state != "uploading":
+                    raise ValueError(f"upload is {job.state}")
+                job = advance(job, "failed", error=CANCELLED)
+                self.put(job)
+            for key in job.quota:
+                self.kv[key] = [i for i in self.kv.get(key, []) if i != job.id]
+            return job
 
 
 class Runner(Protocol):
@@ -161,7 +210,11 @@ class Runner(Protocol):
 
 
 def part_path(s: Settings, job_id: str, n: int) -> Path:
-    return s.uploads_dir / job_id / f"{n:05d}"
+    return parts_dir(s, job_id) / f"{n:05d}"
+
+
+def parts_dir(s: Settings, job_id: str) -> Path:
+    return s.uploads_dir / job_id
 
 
 def write_part(s: Settings, job_id: str, n: int, data: bytes) -> None:
@@ -191,7 +244,16 @@ def assemble(s: Settings, job: Job) -> None:
             with p.open("rb") as fh:
                 shutil.copyfileobj(fh, out, 1 << 20)
     tmp.replace(dest)
-    shutil.rmtree(s.uploads_dir / job.id, ignore_errors=True)
+    shutil.rmtree(parts_dir(s, job.id), ignore_errors=True)
+
+
+def discard(s: Settings, job: Job) -> None:
+    """Delete what a failed or cancelled job left on disk: upload parts, and for a user's job its video and
+    film dir (an admin's video may predate the job, so it stays). Safe to repeat."""
+    shutil.rmtree(parts_dir(s, job.id), ignore_errors=True)
+    if job.owner:
+        (s.videos_dir / job.video).unlink(missing_ok=True)
+        shutil.rmtree(s.films_dir / job.film_id, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- the job body
@@ -294,10 +356,8 @@ def run_job(job_id: str, s: Settings, store: JobStore, *, caption: bool = True, 
     except Exception as e:
         msg = str(e) if isinstance(e, JobError) else f"processing failed: {type(e).__name__}: {e}"
         log(f"[job {job.id}] {msg}")
-        if job.owner:  # an admin's video may predate the job, so only clean up user uploads
-            video.unlink(missing_ok=True)
-            shutil.rmtree(s.films_dir / job.film_id, ignore_errors=True)
-            sync()
+        discard(s, job)
+        sync()
         store.put(advance(job, "failed", error=msg))
 
 

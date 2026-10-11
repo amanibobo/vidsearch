@@ -2,11 +2,13 @@
 
 Auth0 is replaced by a locally generated RSA key whose JWKS is served by a patched fetch, and
 jobs run on the in-process LocalRunner with the stand-in models from test_pipeline.py, so this
-stays offline and fast.
+stays offline and fast. Browser identities (`device:<32 hex>`) are their own bearer tokens.
 """
 
 import base64
 import json
+import secrets
+import shutil
 import time
 from dataclasses import asdict, replace
 
@@ -18,9 +20,10 @@ from fastapi.testclient import TestClient
 from test_pipeline import StubCaptioner, StubImage, StubText, _make_clip
 
 import vidsearch.library
+import vidsearch.server
 from vidsearch.config import Settings
 from vidsearch.ingest import ingest_video
-from vidsearch.jobs import STALE_AFTER_S, JobStore, LocalRunner, new_job
+from vidsearch.jobs import STALE_AFTER_S, JobStore, LocalRunner, new_job, user_bucket
 from vidsearch.library import Library
 from vidsearch.server import create_app
 
@@ -38,7 +41,11 @@ def token(sub, *, aud=AUDIENCE, iss=ISSUER, ttl=3600, key=KEY):
 
 
 def auth(sub, **kw):
-    return {"Authorization": f"Bearer {token(sub, **kw)}"}
+    return {"Authorization": f"Bearer {sub if sub.startswith('device:') else token(sub, **kw)}"}
+
+
+def device():
+    return f"device:{secrets.token_hex(16)}"
 
 
 class RecordingKV(dict):
@@ -71,6 +78,8 @@ def env(tmp_path_factory):
     s.auth0_audience = AUDIENCE
     s.upload_part_bytes = 64 * 1024
     s.max_upload_minutes = 0.25  # 15 s, so too-long.mp4 (24 s) is over and all-red.mp4 (10 s) is under
+    s.anon_uploads = True  # browser identities beside Auth0
+    s.uploads_per_ip_per_day = s.uploads_global_per_day = 1000  # every request here comes from "testclient"
 
     quiet = lambda m: None  # noqa: E731
     img, txt = StubImage(), StubText()
@@ -363,10 +372,10 @@ def test_stale_jobs_read_as_timed_out(env):
     ids = {}
     for name, (fields, _) in cases.items():
         job = replace(new_job("kim", name, "url", ".mp4", url="https://example.com/a.mp4"), created=old, **fields)
-        store.create(job, daily_limit=99)
+        store.create(job, [])
         ids[name] = job.id
     legacy = new_job("kim", "legacy", "url", ".mp4", url="https://example.com/a.mp4")
-    store.create(legacy, daily_limit=99)
+    store.create(legacy, [])
     rec = asdict(replace(legacy, state="processing", stage="captioning", created=old))
     del rec["updated"]  # written before jobs had `updated`
     kv[f"job:{legacy.id}"] = rec
@@ -379,3 +388,159 @@ def test_stale_jobs_read_as_timed_out(env):
         assert listed[ids[name]]["state"] == state, name
         assert (job["error"] == "processing timed out") == (state == "failed"), name
     assert kv[f"job:{ids['processing, idle 71 min']}"]["state"] == "processing"  # reported, not rewritten
+
+
+# ---------------------------------------------------------------- uploads without sign-in (browser identities)
+
+ID = "0123456789abcdef0123456789abcdef"
+
+
+def device_app(tmp_path, **overrides):
+    """An API with VS_ANON_UPLOADS=1 and no Auth0: device ids are the only identities."""
+    s = Settings()
+    s.data_dir, s.videos_dir = tmp_path / "data", tmp_path / "videos"
+    s.auth0_domain, s.dev_auth, s.anon_uploads, s.ip_salt = "", False, True, "test-salt"
+    s.upload_part_bytes = 1024
+    for k, v in overrides.items():
+        setattr(s, k, v)
+    kv = {}
+    lib = Library(s, image_embedder=StubImage(), log=lambda m: None)
+    return TestClient(create_app(lib=lib, s=s, runner=LocalRunner(s, JobStore(kv), log=lambda m: None))), s, kv
+
+
+def test_device_ids(tmp_path):
+    c, *_ = device_app(tmp_path)
+    with c:
+        assert c.get("/api/jobs", headers=auth(f"device:{ID}")).status_code == 200
+        assert c.get("/api/library").status_code == 200
+        assert c.get("/api/jobs").status_code == 401
+        for bad in (f"device:{ID[:-1]}", f"device:{ID}0", f"device:{ID.upper()}", ID, f"device:{'g' * 32}",
+                    "device:", f"Device:{ID}", "dev:tester", token("tester")):
+            for path in ("/api/jobs", "/api/library"):
+                assert c.get(path, headers={"Authorization": f"Bearer {bad}"}).status_code == 401, (bad, path)
+
+
+def test_library_advertises_the_upload_mode(env, tmp_path):
+    c, s, *_ = env
+    uploads = c.get("/api/library").json()["uploads"]
+    assert uploads["mode"] == "account"  # Auth0 configured: sign-in wins, device ids still work
+    assert c.get("/api/jobs", headers=auth(device())).status_code == 200
+    assert uploads["limits"] == {"uploads_per_day": 3, "uploads_per_ip_per_day": 1000, "uploads_global_per_day": 1000,
+                                 "max_bytes": s.max_upload_bytes, "max_minutes": 0.25, "part_size": 64 * 1024}
+    for anon, dev_auth, mode in ((True, False, "device"), (False, False, "off"), (True, True, "account")):
+        c2, *_ = device_app(tmp_path / mode, anon_uploads=anon, dev_auth=dev_auth)
+        with c2:
+            assert c2.get("/api/library").json()["uploads"]["mode"] == mode, (anon, dev_auth)
+
+
+def test_device_upload_is_private_to_that_browser(env):
+    c, s, clips, _ = env
+    me, other = device(), device()
+    job = wait_for(c, upload(c, clips / "all-red.mp4", me, "Browser Red"), me)
+    assert job["state"] == "done" and job["owner"] == me and "quota" not in job
+    fid = job["film_id"]
+    assert {f["id"]: f for f in c.get("/api/library", headers=auth(me)).json()["films"]}[fid]["owner_is_you"]
+    mine = c.get("/api/search", params={"q": "red", "k": 50}, headers=auth(me)).json()["results"]
+    assert any(r["film_id"] == fid for r in mine)
+    for headers in ({}, auth(other), auth("alice")):
+        assert fid not in {f["id"] for f in c.get("/api/library", headers=headers).json()["films"]}
+        res = c.get("/api/search", params={"q": "red", "k": 50, "heatmap": 1}, headers=headers).json()
+        assert all(r["film_id"] != fid for r in res["results"]) and fid not in res["heatmap"]["films"]
+        assert c.get(f"/api/jobs/{job['id']}", headers=headers).status_code in (401, 403)
+    assert c.delete(f"/api/films/{fid}", headers=auth(other)).status_code == 403
+    assert c.delete(f"/api/films/{fid}", headers=auth(me)).status_code == 200
+
+
+def test_per_ip_and_global_daily_caps(tmp_path):
+    c, s, kv = device_app(tmp_path, uploads_per_ip_per_day=2, uploads_global_per_day=3,
+                          client_ip_header="X-Forwarded-For")
+    body = {"title": "x", "filename": "x.mp4", "size": 10}
+
+    def start(who, forwarded):
+        return c.post("/api/uploads", json=body, headers={**auth(who), "X-Forwarded-For": forwarded})
+
+    with c:
+        # The proxy appends the client's address; entries left of it are whatever the client sent.
+        assert start(device(), "10.0.0.1, 203.0.113.7").status_code == 200
+        assert start(device(), "10.0.0.2, 203.0.113.7").status_code == 200
+        r = start(device(), "10.0.0.3,203.0.113.7")
+        assert r.status_code == 429
+        assert r.json()["detail"] == "daily limit of 2 uploads from this network reached; try again after 00:00 UTC"
+        assert start(device(), "203.0.113.7, 198.51.100.9").status_code == 200
+        r = start(device(), "198.51.100.10")
+        assert r.status_code == 429
+        assert r.json()["detail"] == ("the archive's daily limit of 3 uploads across everyone is reached; "
+                                      "try again after 00:00 UTC")
+        assert not any(ip in repr(kv) for ip in ("203.0.113.7", "198.51.100.9", "198.51.100.10"))
+
+
+def test_cancel_gives_the_slots_back_and_removes_parts(tmp_path, monkeypatch):
+    c, s, kv = device_app(tmp_path, uploads_per_day=1, uploads_per_ip_per_day=1, uploads_global_per_day=1)
+    body = {"title": "x", "filename": "x.mp4", "size": 3 * s.upload_part_bytes}
+    part = b"x" * s.upload_part_bytes
+    me, other = device(), device()
+    with c:
+        uid = c.post("/api/uploads", json=body, headers=auth(me)).json()["upload_id"]
+        for n in (0, 1):
+            assert c.put(f"/api/uploads/{uid}/parts/{n}", content=part, headers=auth(me)).status_code == 200
+        assert (s.uploads_dir / uid).is_dir()
+        assert c.post("/api/uploads", json=body, headers=auth(other)).status_code == 429
+        assert c.delete(f"/api/uploads/{uid}").status_code == 401
+        assert c.delete(f"/api/uploads/{uid}", headers=auth(other)).status_code == 403
+        for _ in range(2):
+            assert c.delete(f"/api/uploads/{uid}", headers=auth(me)).status_code == 200
+        job = c.get(f"/api/jobs/{uid}", headers=auth(me)).json()
+        assert job["state"] == "failed" and job["error"] == "cancelled"
+        assert not (s.uploads_dir / uid).exists()
+        assert c.get("/api/jobs", headers=auth(me)).json()["uploads_today"] == 0
+        assert c.put(f"/api/uploads/{uid}/parts/2", content=part, headers=auth(me)).status_code == 409
+        assert c.post(f"/api/uploads/{uid}/complete", json={"parts": 3}, headers=auth(me)).status_code == 409
+        assert not (s.uploads_dir / uid).exists()
+
+        # The user, IP and global slots are all free again: another browser on the same network can start.
+        uid2 = c.post("/api/uploads", json=body, headers=auth(other)).json()["upload_id"]
+
+        # A part in flight when the cancel lands must not leave a parts dir behind.
+        def cancel_lands_first(s_, job_id, n, data):
+            assert c.delete(f"/api/uploads/{job_id}", headers=auth(other)).status_code == 200
+            real_write_part(s_, job_id, n, data)
+
+        real_write_part = vidsearch.server.write_part
+        monkeypatch.setattr(vidsearch.server, "write_part", cancel_lands_first)
+        assert c.put(f"/api/uploads/{uid2}/parts/0", content=part, headers=auth(other)).status_code == 409
+        assert not (s.uploads_dir / uid2).exists()
+
+
+def test_cancel_refuses_a_finished_upload(tmp_path):
+    c, *_ = device_app(tmp_path)
+    me = device()
+    with c:
+        uid = c.post("/api/uploads", json={"title": "x", "filename": "x.mp4", "size": 10}, headers=auth(me)).json()["upload_id"]
+        assert c.put(f"/api/uploads/{uid}/parts/0", content=b"not video!", headers=auth(me)).status_code == 200
+        assert c.post(f"/api/uploads/{uid}/complete", json={"parts": 1}, headers=auth(me)).status_code == 200
+        r = c.delete(f"/api/uploads/{uid}", headers=auth(me))
+        assert r.status_code == 409 and r.json()["detail"].startswith("upload is ")
+        assert c.get("/api/jobs", headers=auth(me)).json()["uploads_today"] == 1
+
+
+def test_timed_out_job_leaves_nothing_behind(env):
+    c, s, clips, kv = env
+    me, quiet = device(), (lambda m: None)
+    old = time.time() - STALE_AFTER_S - 60
+    job = new_job(me, "Stuck", "file", ".mp4", size=10, part_size=10)
+    # Its worker died while captioning: the film is ingested and loaded, and a stray parts dir is left too.
+    shutil.copy(clips / "all-red.mp4", s.videos_dir / job.video)
+    assert ingest_video(s.videos_dir / job.video, s, owner=me, embedder=StubImage(), log=quiet) == job.film_id
+    (s.uploads_dir / job.id).mkdir(parents=True)
+    (s.uploads_dir / job.id / "00000").write_bytes(b"x")
+    JobStore(kv).create(replace(job, state="processing", stage="captioning", created=old, updated=old), [])
+    c.post("/api/reload")
+    assert c.get(f"/api/video/{job.film_id}").status_code == 200  # loaded (the library call would reap it)
+
+    for _ in range(2):  # every read reports it; cleaning up again is harmless
+        got = c.get(f"/api/jobs/{job.id}", headers=auth(me)).json()
+        assert got["state"] == "failed" and got["error"] == "processing timed out"
+    assert not (s.videos_dir / job.video).exists()
+    assert not (s.films_dir / job.film_id).exists()
+    assert not (s.uploads_dir / job.id).exists()
+    assert job.film_id not in {f["id"] for f in c.get("/api/library", headers=auth(me)).json()["films"]}

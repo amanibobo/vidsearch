@@ -74,7 +74,7 @@ Each chunk sends up to 4 frames from one shot (long shots are split into 12 s ch
 
 | Route | Returns |
 |---|---|
-| `GET /api/library` | films the caller can see: title, duration, `n_frames`, `sample_fps`, `shots`, `atlas` layout + `urls`, `video_url`, `owner_is_you` |
+| `GET /api/library` | films the caller can see: title, duration, `n_frames`, `sample_fps`, `shots`, `atlas` layout + `urls`, `video_url`, `owner_is_you`. Also `uploads`: `{mode, limits}`, where `mode` is `off`, `device` or `account` (below) |
 | `GET /api/search?q=being+chased&k=24` | ranked moments (below). Optional `films=id1,id2`, `gap=` (sec), `use=frame,window,caption` |
 | `GET /api/heatmap?q=...` | per visible film, base64 `uint8` per sampled frame (0–255 relevance) |
 | `GET /api/video/{id}` | source video with Range support, so `<video>` can seek |
@@ -82,15 +82,16 @@ Each chunk sends up to 4 frames from one shot (long shots are split into 12 s ch
 | `GET /media/{id}/atlas/000.jpg` | thumbnail texture page |
 | `POST /api/reload` | re-read the data dir |
 
-Signed-in routes (`Authorization: Bearer <Auth0 access token>`):
+Signed-in routes (`Authorization: Bearer <Auth0 access token>`, or `Bearer device:<id>` when uploads without sign-in are on):
 
 | Route | Does |
 |---|---|
-| `POST /api/uploads` `{title, filename, size}` | starts a browser upload: `{upload_id, part_size, parts}`. 413 over the size limit, 429 over the daily limit |
+| `POST /api/uploads` `{title, filename, size}` | starts a browser upload: `{upload_id, part_size, parts}`. 413 over the size limit, 429 over a daily limit (the message names which) |
 | `PUT /api/uploads/{id}/parts/{n}` | raw bytes of part `n` (0-based, `part_size` bytes except the last). Re-sending a part replaces it, so retry or resume freely |
 | `POST /api/uploads/{id}/complete` `{parts}` | checks every part arrived, assembles the file, starts the job: `{job_id}` (the same id as `upload_id`) |
+| `DELETE /api/uploads/{id}` | cancels an unfinished upload (owner only): the job fails with error `cancelled`, its parts are deleted and it stops counting against any limit. 409 once it has completed. Repeating it is harmless |
 | `POST /api/uploads/url` `{title, url}` | the server downloads a direct http(s) video link: `{job_id}` |
-| `GET /api/jobs` | `{jobs, uploads_today, limits}`, the caller's recent jobs, newest first |
+| `GET /api/jobs` | `{jobs, uploads_today, limits}`, the caller's recent jobs, newest first. `uploads_today` counts the caller's own uploads |
 | `GET /api/jobs/{id}` | one job (owner only) |
 | `DELETE /api/films/{id}` | deletes one of the caller's films and its video. 403 for someone else's film or a public one |
 
@@ -108,13 +109,44 @@ For local end-to-end testing without a tenant, start the API with `VS_DEV_AUTH=1
 logs a warning at startup. A configured domain always wins, so dev auth can't be switched on
 in a deployment that has sign-in. Never set it on a server other people can reach.
 
+**Uploads without sign-in.** With `VS_ANON_UPLOADS=1`, the browser is the identity. On the first
+upload the frontend generates a random 128-bit id with `crypto.getRandomValues`, keeps it in
+`localStorage` and sends `Authorization: Bearer device:<32 lowercase hex>`; the API treats it as
+user `device:<hex>`. The id is a bearer secret: whoever holds it sees and deletes those uploads,
+and clearing site data loses them. Any other `device:` token is a 401. This works with or without
+Auth0 (Auth0 subs never start with `device:`), and dev auth stays available for tests.
+
+`GET /api/library` tells the frontend what to offer, so no build flag is needed: `uploads.mode` is
+`account` when Auth0 (or dev auth) is configured, `device` when only `VS_ANON_UPLOADS=1` is, and
+`off` otherwise. Accounts win, so setting an Auth0 domain later brings sign-in back even while
+`VS_ANON_UPLOADS=1` stays set; uploads made by browser id then stay reachable only through the API.
+
 Uploads are private to the uploader. Everyone sees the public films (no `owner` in
 `film.json`: the admin-ingested ones), and each user also sees their own. Library, search and
 heatmap all filter by this, and search applies it before each index pools candidates, so
 private films can't crowd out results either.
 
-Each user gets 3 uploads per UTC day (counted when the upload starts, whether or not it
-finishes), each at most 2 GB and 60 minutes long.
+Each upload is at most 2 GB and 60 minutes long. Three daily limits (UTC days) protect the bill,
+counted when an upload starts; a cancelled upload gives its slot back to all three:
+
+| Limit | Default | Env |
+|---|---|---|
+| per user or browser id | 3 | `VS_UPLOADS_PER_DAY` |
+| per client IP | 5 | `VS_UPLOADS_PER_IP_PER_DAY` |
+| across everyone | 20 | `VS_UPLOADS_GLOBAL_PER_DAY` |
+
+Over any of them the start is a 429 whose message names the limit. The client IP is the TCP peer,
+or, when `VS_CLIENT_IP_HEADER` names a header (e.g. `X-Forwarded-For`), that header's right-most
+entry: the proxy appends the address it saw, and anything to its left is whatever the client sent.
+IPs are stored only as `sha256(VS_IP_SALT, ip)`. Without `VS_IP_SALT` the server picks a random
+salt per process, so per-IP counts reset on restart.
+
+**Check the proxy at deploy time.** Behind Modal's proxy, `request.client.host` may be the proxy
+rather than the visitor. Then every visitor shares one IP bucket (5 uploads a day for everyone,
+which fails safe but is tight). Log `request.client.host` and `X-Forwarded-For` for a request from a
+known address. If the header's right-most entry is the visitor, set
+`VS_CLIENT_IP_HEADER=X-Forwarded-For`. If it isn't, find the header that is before trusting it:
+a header the client can set is no limit at all.
 
 A job record, from `GET /api/jobs/{id}`:
 
@@ -134,7 +166,8 @@ A job record, from `GET /api/jobs/{id}`:
 
 Poll `GET /api/jobs/{id}` until `state` is `done` or `failed`. A `queued` or `processing`
 job whose record hasn't changed for 70 minutes (the GPU function's 60-minute timeout plus a
-margin) reads back as `failed` with error `processing timed out`: its worker is gone. When the API sees a finished
+margin) reads back as `failed` with error `processing timed out`: its worker is gone, so the API
+deletes the job's leftover parts, video and film dir the first time it reports that. When the API sees a finished
 job, it reloads the library, so the film is in `GET /api/library` with no `POST /api/reload`.
 A video over 60 minutes, or a file ffprobe can't read as video, fails with a message saying so.
 URL downloads stop at 2 GB and refuse hosts that resolve to private addresses.
@@ -152,7 +185,7 @@ this if it matters later.
 
 ```bash
 modal secret create vidsearch-anthropic --from-dotenv .env         # ANTHROPIC_API_KEY, VS_CAPTION_MODEL
-modal secret create vidsearch-auth0 VS_AUTH0_DOMAIN=<tenant>.us.auth0.com
+modal secret create vidsearch-auth0 VS_IP_SALT=$(openssl rand -hex 16)  # add VS_AUTH0_DOMAIN once Auth0 is set up
 modal deploy modal_app.py
 modal run modal_app.py::add_film --url <video url> --name "Cops"  # admin: a public film
 ```
@@ -164,7 +197,8 @@ ingest, caption) and commits after ingest and after captions. Job records live i
 `vidsearch-jobs` Dict, so the web container can report progress it didn't compute. `Web` runs
 with `max_containers=1`: all parts of an upload must land in one container's view of the
 Volume, and one container is the only writer of the per-user quota index. `add_film` uses the
-same job body with no owner, so its films stay public.
+same job body with no owner, so its films stay public. `Web` sets `VS_ANON_UPLOADS=1`, so uploads
+work without sign-in; the per-IP limit needs the proxy check above.
 
 A search result:
 
@@ -255,8 +289,9 @@ pytest -q tests/
 The tests use stand-in models (mean colour as the "embedding", hashed bag of words for text)
 on generated clips, so they run in ~15 s without downloading weights. They cover ingest,
 captions with resume, fused search, de-dupe, the heatmap and every API route.
-`tests/test_uploads.py` signs tokens with a throwaway RSA key and covers auth, private
-visibility, quota and size limits, chunked uploads, job failures and delete.
+`tests/test_uploads.py` signs tokens with a throwaway RSA key and covers auth, browser ids, private
+visibility, the per-user, per-IP and global limits, size limits, chunked uploads, cancel, job
+failures, the timed-out job cleanup and delete.
 
 ## Next steps
 

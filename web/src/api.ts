@@ -129,7 +129,7 @@ async function httpError(res: Response, url: string): Promise<HttpError> {
   return new HttpError(res.status, url.split('?')[0]!, detail)
 }
 
-/** Where signed-in requests get their bearer token; null while signed out (or sign-in is off). */
+/** Where signed-in requests get their bearer token; null while signed out (or sign-in is off). A device id is the fallback. */
 export interface TokenSource {
   /** `fresh` skips any cached token, for the one retry after a 401. */
   token(fresh: boolean): Promise<string>
@@ -142,11 +142,17 @@ export const SESSION_EXPIRED = 'your session expired; sign in again'
 let tokens: TokenSource | null = null
 export function setTokenSource(source: TokenSource | null) { tokens = source }
 
+/** This browser's upload identity (see device.ts), sent when no account is signed in; null sends nothing. */
+let device: TokenSource | null = null
+export function setDeviceId(id: string | null) {
+  device = id ? { token: async () => `device:${id}`, expired: () => {} } : null
+}
+
 type Headers = Record<string, string>
 
 /** One HTTP exchange with the caller's bearer token. A 401 gets one retry with a fresh token, then signs the user out. */
 async function authed<T extends { status: number }>(send: (headers: Headers) => Promise<T>): Promise<T> {
-  const source = tokens
+  const source = tokens ?? device
   if (!source) return send({})
   const bearer = async (fresh: boolean): Promise<Headers> => {
     try {
@@ -217,9 +223,18 @@ async function sendJson(method: 'POST' | 'DELETE', path: string, body: unknown, 
   return res.json()
 }
 
-export async function fetchLibrary(signal: AbortSignal): Promise<Film[]> {
+/** What the API offers: `account` uploads need sign-in, `device` uploads are tied to this browser, `off` none. */
+export type UploadsMode = 'off' | 'device' | 'account'
+const UPLOADS_MODES: readonly UploadsMode[] = ['off', 'device', 'account']
+
+export interface Archive { films: Film[]; uploads: UploadsMode }
+
+export async function fetchLibrary(signal: AbortSignal): Promise<Archive> {
   const body = obj(await getJson(api('/api/library'), LIBRARY_RETRY, signal), 'library')
-  return arr(body.films, 'library.films').map(parseFilm)
+  // An API from before `uploads` existed offered sign-in whenever it had Auth0.
+  const mode = body.uploads === undefined ? 'account' : str(obj(body.uploads, 'library.uploads').mode, 'uploads.mode')
+  if (!UPLOADS_MODES.includes(mode as UploadsMode)) throw new Error(`uploads.mode: unknown mode ${mode}`)
+  return { films: arr(body.films, 'library.films').map(parseFilm), uploads: mode as UploadsMode }
 }
 
 export async function runSearch(query: string, signal: AbortSignal): Promise<Extract<Search, { status: 'ready' }>> {
@@ -377,9 +392,14 @@ export async function uploadFile(file: File, title: string, onSent: (bytes: numb
   }
   try {
     await Promise.all(Array.from({ length: Math.min(PART_CONCURRENCY, parts) }, () => worker().catch((e: unknown) => { stop.abort(e); throw e })))
+    await sendJson('POST', `/api/uploads/${id}/complete`, { parts }, signal)
+  } catch (e) {
+    // Cancelled, or a part failed for good: give the day's upload back before reporting it. An upload that did
+    // complete despite the error answers 409 and keeps running.
+    await sendJson('DELETE', `/api/uploads/${id}`, undefined).catch(() => {})
+    throw e
   } finally {
     signal.removeEventListener('abort', onAbort)
   }
-  await sendJson('POST', `/api/uploads/${id}/complete`, { parts }, signal)
   return id
 }

@@ -7,13 +7,17 @@ A token that is present but invalid is a 401 everywhere: it never degrades to an
 For local end-to-end testing without a tenant, VS_DEV_AUTH=1 with an empty VS_AUTH0_DOMAIN accepts
 `Bearer dev:<sub>` as user <sub>. A configured domain always selects the Auth0 verifier, so the dev
 path can't be reached in a deployment that has sign-in.
+
+VS_ANON_UPLOADS=1 also accepts `Bearer device:<32 lowercase hex>`, a random id the browser generates and
+keeps, as user `device:<hex>`. The id is a bearer secret: whoever holds it owns those uploads. Auth0
+subs never start with `device:`, so it sits beside Auth0 without either shadowing the other.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import Callable, Protocol
+from typing import Callable, Literal, Protocol
 
 import jwt
 from fastapi import HTTPException, Request
@@ -55,7 +59,25 @@ class DevVerifier:
         return m.group(1)
 
 
-def make_verifier(s: Settings) -> TokenVerifier | None:
+class DeviceVerifier:
+    """`device:<32 lowercase hex>` -> itself; any other token goes to the account verifier, if there is one."""
+
+    TOKEN = re.compile(r"device:[0-9a-f]{32}")
+
+    def __init__(self, accounts: TokenVerifier | None):
+        self.accounts = accounts
+
+    def user_id(self, token: str) -> str:
+        if token.startswith("device:"):
+            if not self.TOKEN.fullmatch(token):
+                raise jwt.InvalidTokenError("device ids are 'device:' and 32 lowercase hex characters")
+            return token
+        if self.accounts is None:
+            raise jwt.InvalidTokenError("expected 'device:<id>'")
+        return self.accounts.user_id(token)
+
+
+def account_verifier(s: Settings) -> TokenVerifier | None:
     if s.auth0_domain:
         return Verifier(s.auth0_domain, s.auth0_audience)
     if s.dev_auth:
@@ -65,8 +87,24 @@ def make_verifier(s: Settings) -> TokenVerifier | None:
     return None
 
 
+def make_verifier(s: Settings) -> TokenVerifier | None:
+    accounts = account_verifier(s)
+    return DeviceVerifier(accounts) if s.anon_uploads else accounts
+
+
+UploadsMode = Literal["off", "device", "account"]
+
+
+def uploads_mode(s: Settings) -> UploadsMode:
+    """What the frontend should offer: sign-in when accounts exist (they win over device ids, so configuring
+    Auth0 later brings sign-in back even with VS_ANON_UPLOADS still set), else uploads tied to the browser."""
+    if s.auth0_domain or s.dev_auth:
+        return "account"
+    return "device" if s.anon_uploads else "off"
+
+
 def user_dependencies(s: Settings) -> tuple[Callable[[Request], str | None], Callable[[Request], str]]:
-    """(optional_user, required_user) for Depends(). Empty VS_AUTH0_DOMAIN (without dev auth) turns auth off."""
+    """(optional_user, required_user) for Depends(). No Auth0 domain, dev auth or anon uploads turns auth off."""
     verifier = make_verifier(s)
 
     def optional_user(request: Request) -> str | None:

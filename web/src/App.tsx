@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from 'react'
 import { AccountCorner } from './Account'
-import { fetchLibrary, frameStillUrl, libraryLoaded, libraryRefreshed, momentAt, pageSettled, runSearch, type Film, type FilmId, type Hover, type Library, type Moment, type Search } from './api'
+import { fetchLibrary, frameStillUrl, libraryLoaded, libraryRefreshed, momentAt, pageSettled, runSearch, setDeviceId, type Film, type FilmId, type Hover, type Library, type Moment, type Search, type UploadsMode } from './api'
 import { useAccount } from './auth'
+import { newDeviceId, storedDeviceId } from './device'
 import { layoutLibrary } from './layout'
 import { Loader, useElapsed } from './Loader'
 import { Masthead } from './Masthead'
@@ -37,28 +38,49 @@ export function App() {
   const inflight = useRef<AbortController | null>(null)
   const anchorSink = useRef<AnchorSink | null>(null)
   const { session } = useAccount()
-  const viewer = session.status === 'signed-in' ? session.viewer.sub : null
+  /** From the API with the library; null until it first answers. */
+  const [uploadsMode, setUploadsMode] = useState<UploadsMode | null>(null)
+  /** This browser's upload identity in `device` mode; null until it first uploads (or opens its uploads). */
+  const [device, setDevice] = useState<string | null>(null)
+  const viewer = uploadsMode === 'device' ? device : session.status === 'signed-in' ? session.viewer.sub : null
   const [focus, setFocus] = useState<FilmFocus | null>(null)
   /** The viewer the library was last fetched for. */
   const loadedFor = useRef(viewer)
 
-  // The first load waits for sign-in to settle, so a signed-in viewer's own films come with it.
+  // The first load waits for sign-in to settle, so a signed-in viewer's own films come with it. In device mode
+  // (known only from the answer) a browser that has uploaded before asks again as itself, before anything shows.
   const wakingSince = library.status === 'waking' ? library.since : null
   const authSettled = session.status !== 'checking'
   useEffect(() => {
     if (wakingSince === null || !authSettled) return
     const ctrl = new AbortController()
-    loadedFor.current = viewer
-    fetchLibrary(ctrl.signal)
-      .then((films) => setLibrary(libraryLoaded(films)))
-      .catch((e: unknown) => { if (!isAbort(e)) setLibrary({ status: 'error', message: errorMessage(e) }) })
+    const load = async () => {
+      const first = await fetchLibrary(ctrl.signal)
+      const id = first.uploads === 'device' ? storedDeviceId() : null
+      setDeviceId(id)
+      const archive = id ? await fetchLibrary(ctrl.signal) : first
+      loadedFor.current = archive.uploads === 'device' ? id : viewer
+      setUploadsMode(archive.uploads)
+      setDevice(id)
+      setLibrary(libraryLoaded(archive.films))
+    }
+    load().catch((e: unknown) => { if (!isAbort(e)) setLibrary({ status: 'error', message: errorMessage(e) }) })
     return () => ctrl.abort()
   }, [wakingSince, authSettled])
+
+  /** The first upload (or look at my uploads) in device mode mints this browser's id. Nothing to refetch: it owns no films yet. */
+  const ensureDevice = useCallback(() => {
+    if (device) return
+    const id = newDeviceId()
+    setDeviceId(id)
+    loadedFor.current = id
+    setDevice(id)
+  }, [device])
   const retryLibrary = useCallback(() => setLibrary({ status: 'waking', since: Date.now() }), [])
 
   /** Refetch after the visible set changed (sign-in or out, a finished upload, a delete) without the first-load loader. */
   const refreshLibrary = useCallback(async () => {
-    const films = await fetchLibrary(new AbortController().signal)
+    const { films } = await fetchLibrary(new AbortController().signal)
     setLibrary((l) => (l.status === 'waking' ? l : libraryRefreshed(l, films)))
   }, [])
   useEffect(() => {
@@ -138,7 +160,7 @@ export function App() {
         <Scene layout={layout} search={search} hover={hover} stepped={stepped} focus={focus} onHover={onHover} onPageSettled={onPageSettled} anchorSink={anchorSink} />
       </div>
       <Masthead films={films.length ? films : null} />
-      {ready && <AccountCorner uploads={uploads} films={films} onLibraryChanged={onLibraryChanged} />}
+      {ready && uploadsMode && <AccountCorner mode={uploadsMode} uploads={uploads} films={films} onLibraryChanged={onLibraryChanged} onDeviceNeeded={ensureDevice} />}
       <Loader library={library} onRetry={retryLibrary} />
       {hover.kind === 'frame' && <HoverCard hover={hover} film={films.find((f) => f.id === hover.filmId)} sink={anchorSink} />}
       <SearchPill status={pillStatus(search, focusIndex)} disabled={!ready} onSubmit={submit} />

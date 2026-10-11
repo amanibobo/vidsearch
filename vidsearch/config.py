@@ -51,15 +51,27 @@ class Settings:
     # Built frontend (web/dist) to serve at /, so one server hosts API, media and app. "" = API only.
     web_dist: str = field(default_factory=lambda: _env("VS_WEB_DIST", ""))
 
-    # Auth0 sign-in for uploads. Empty domain = auth off: everyone is anonymous and uploads return 503.
+    # Auth0 sign-in for uploads. Empty domain (and no anon_uploads) = auth off: everyone is anonymous and uploads return 503.
     auth0_domain: str = field(default_factory=lambda: _env("VS_AUTH0_DOMAIN", ""))
     auth0_audience: str = field(default_factory=lambda: _env("VS_AUTH0_AUDIENCE", "https://vidsearch-api"))
     # Local testing only: with no Auth0 domain, accept `Bearer dev:<sub>` as user <sub>. Ignored when a domain is set.
     dev_auth: bool = field(default_factory=lambda: _env("VS_DEV_AUTH", "") == "1")
 
+    # Uploads without sign-in: `Bearer device:<32 lowercase hex>`, a random id the browser keeps, is a user.
+    # Works with or without Auth0.
+    anon_uploads: bool = field(default_factory=lambda: _env("VS_ANON_UPLOADS", "") == "1")
+
     # Uploaded and downloaded source videos land here as <film_id><ext>.
     videos_dir: Path = field(default_factory=lambda: Path(_env("VS_VIDEOS", "videos")))
-    uploads_per_day: int = field(default_factory=lambda: int(_env("VS_UPLOADS_PER_DAY", "3")))
+    # Daily upload limits (UTC days), counted when an upload starts; a cancelled upload gives its slot back.
+    uploads_per_day: int = field(default_factory=lambda: int(_env("VS_UPLOADS_PER_DAY", "3")))  # per user or device
+    uploads_per_ip_per_day: int = field(default_factory=lambda: int(_env("VS_UPLOADS_PER_IP_PER_DAY", "5")))
+    uploads_global_per_day: int = field(default_factory=lambda: int(_env("VS_UPLOADS_GLOBAL_PER_DAY", "20")))
+    # Request header carrying the client IP behind a proxy, e.g. X-Forwarded-For. Its right-most entry is used,
+    # since the proxy appends and anything left of that is whatever the client sent. "" = the TCP peer.
+    client_ip_header: str = field(default_factory=lambda: _env("VS_CLIENT_IP_HEADER", ""))
+    # Client IPs are only stored as sha256(salt, ip). "" = a random salt per process, so per-IP counts reset on restart.
+    ip_salt: str = field(default_factory=lambda: _env("VS_IP_SALT", ""))
     max_upload_bytes: int = field(default_factory=lambda: int(_env("VS_MAX_UPLOAD_BYTES", str(2 * 1024**3))))
     max_upload_minutes: float = field(default_factory=lambda: float(_env("VS_MAX_UPLOAD_MINUTES", "60")))
     upload_part_bytes: int = field(default_factory=lambda: int(_env("VS_UPLOAD_PART_BYTES", str(8 * 1024**2))))

@@ -1,15 +1,42 @@
 import { useEffect, useRef, useState, type DragEvent, type FormEvent, type ReactNode } from 'react'
-import { deleteFilm, STAGES, type Film, type FilmId, type Job, type Jobs } from './api'
-import { useAccount, type Viewer } from './auth'
+import { deleteFilm, STAGES, type Film, type FilmId, type Job, type Jobs, type UploadsMode } from './api'
+import { useAccount, type Session, type Viewer } from './auth'
 import { checkFile, formatBytes, titleFrom, uploadActive, type Upload, type Uploads } from './uploads'
 
 type Panel = 'none' | 'menu' | 'upload' | 'mine'
 
-/** Top-right account corner: `sign in` when signed out; signed in, an initial with a menu, the upload panels and a progress chip. */
-export function AccountCorner({ uploads, films, onLibraryChanged }: { uploads: Uploads; films: readonly Film[]; onLibraryChanged: () => void }) {
+/** What the top-right corner offers, from the API's upload mode and this build's sign-in. */
+type Corner =
+  | { kind: 'hidden' }
+  | { kind: 'sign-in'; notice: string | null }
+  | { kind: 'signed-in'; viewer: Viewer }
+  /** Uploads tied to this browser: `upload` and `my uploads` right in the corner, no account. */
+  | { kind: 'device' }
+
+function cornerFor(mode: UploadsMode, session: Session): Corner {
+  if (mode === 'device') return { kind: 'device' }
+  if (mode === 'off') return { kind: 'hidden' }
+  if (session.status === 'signed-in') return { kind: 'signed-in', viewer: session.viewer }
+  if (session.status === 'signed-out') return { kind: 'sign-in', notice: session.notice }
+  return { kind: 'hidden' }  // still checking, or this build has no sign-in configured
+}
+
+/**
+ * Top-right corner. Account mode: `sign in` when signed out; signed in, an initial with a menu. Device mode: `upload`
+ * and `my uploads` links. Either way the upload panels and a progress chip while an upload runs.
+ */
+export function AccountCorner({ mode, uploads, films, onLibraryChanged, onDeviceNeeded }: {
+  mode: UploadsMode
+  uploads: Uploads
+  films: readonly Film[]
+  onLibraryChanged: () => void
+  /** Device mode: make sure this browser has its id before a panel asks the API about its uploads. */
+  onDeviceNeeded: () => void
+}) {
   const { session, signIn, signOut } = useAccount()
   const [panel, setPanel] = useState<Panel>('none')
   const root = useRef<HTMLDivElement>(null)
+  const corner = cornerFor(mode, session)
 
   useEffect(() => {
     if (panel !== 'menu') return
@@ -18,38 +45,51 @@ export function AccountCorner({ uploads, films, onLibraryChanged }: { uploads: U
     return () => window.removeEventListener('pointerdown', close)
   }, [panel])
 
-  if (session.status === 'off' || session.status === 'checking') return null
-  if (session.status === 'signed-out') {
+  if (corner.kind === 'hidden') return null
+  if (corner.kind === 'sign-in') {
     return (
       <div className="account">
         <div className="account-bar">
           <button type="button" className="account-link account-signin" onClick={signIn}>sign in</button>
         </div>
-        {session.notice && <p className="account-notice">{session.notice}</p>}
+        {corner.notice && <p className="account-notice">{corner.notice}</p>}
       </div>
     )
   }
 
-  const toggle = (p: Panel) => setPanel((cur) => (cur === p ? 'none' : p))
+  const open = (p: Panel) => {
+    if (corner.kind === 'device' && p !== 'none') onDeviceNeeded()
+    setPanel(p)
+  }
+  const toggle = (p: Panel) => open(panel === p ? 'none' : p)
   const active = uploads.list.find(uploadActive)
   return (
     <div className="account" ref={root}>
-      <div className="account-bar">
-        {active && <StatusChip upload={active} onClick={() => setPanel('upload')} />}
-        <button type="button" className="account-avatar" aria-label={`account: ${session.viewer.name}`} aria-expanded={panel === 'menu'} onClick={() => toggle('menu')}>
-          <Avatar viewer={session.viewer} />
-        </button>
-        {panel === 'menu' && (
-          <div className="menu" role="menu">
-            <p className="menu-who">{session.viewer.name}</p>
-            <button type="button" role="menuitem" onClick={() => setPanel('upload')}>upload</button>
-            <button type="button" role="menuitem" onClick={() => setPanel('mine')}>my uploads</button>
-            <button type="button" role="menuitem" onClick={signOut}>sign out</button>
-          </div>
+      <div className={`account-bar${corner.kind === 'device' ? ' device' : ''}`}>
+        {active && <StatusChip upload={active} onClick={() => open('upload')} />}
+        {corner.kind === 'device' ? (
+          <>
+            <button type="button" className="account-link" aria-expanded={panel === 'upload'} onClick={() => toggle('upload')}>upload</button>
+            <button type="button" className="account-link" aria-expanded={panel === 'mine'} onClick={() => toggle('mine')}>my uploads</button>
+          </>
+        ) : (
+          <>
+            <button type="button" className="account-avatar" aria-label={`account: ${corner.viewer.name}`} aria-expanded={panel === 'menu'} onClick={() => toggle('menu')}>
+              <Avatar viewer={corner.viewer} />
+            </button>
+            {panel === 'menu' && (
+              <div className="menu" role="menu">
+                <p className="menu-who">{corner.viewer.name}</p>
+                <button type="button" role="menuitem" onClick={() => open('upload')}>upload</button>
+                <button type="button" role="menuitem" onClick={() => open('mine')}>my uploads</button>
+                <button type="button" role="menuitem" onClick={signOut}>sign out</button>
+              </div>
+            )}
+          </>
         )}
       </div>
-      {panel === 'upload' && <UploadPanel uploads={uploads} onClose={() => setPanel('none')} />}
-      {panel === 'mine' && <MyUploads uploads={uploads} films={films} onClose={() => setPanel('none')} onLibraryChanged={onLibraryChanged} />}
+      {panel === 'upload' && <UploadPanel uploads={uploads} onClose={() => open('none')} />}
+      {panel === 'mine' && <MyUploads uploads={uploads} films={films} browserOnly={corner.kind === 'device'} onClose={() => open('none')} onLibraryChanged={onLibraryChanged} />}
     </div>
   )
 }
@@ -240,13 +280,13 @@ const when = (t: number) => new Date(t * 1000).toLocaleString('en-US', { month: 
 
 function jobLabel(job: Job, inLibrary: boolean): string {
   if (job.state === 'done') return inLibrary ? 'ready' : 'deleted'
-  if (job.state === 'failed') return `failed: ${job.error ?? 'unknown error'}`
+  if (job.state === 'failed') return job.error === 'cancelled' ? 'cancelled' : `failed: ${job.error ?? 'unknown error'}`
   if (job.state === 'uploading') return 'upload not finished'
   if (job.state === 'queued') return 'queued'
   return job.stage ?? 'processing'
 }
 
-function MyUploads({ uploads, films, onClose, onLibraryChanged }: { uploads: Uploads; films: readonly Film[]; onClose: () => void; onLibraryChanged: () => void }) {
+function MyUploads({ uploads, films, browserOnly, onClose, onLibraryChanged }: { uploads: Uploads; films: readonly Film[]; browserOnly: boolean; onClose: () => void; onLibraryChanged: () => void }) {
   const [confirming, setConfirming] = useState<FilmId | null>(null)
   const [deleting, setDeleting] = useState<FilmId | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -266,12 +306,13 @@ function MyUploads({ uploads, films, onClose, onLibraryChanged }: { uploads: Upl
   const jobs = uploads.jobs?.jobs
   return (
     <PanelFrame title="my uploads" className="mine" onClose={onClose}>
+      {browserOnly && <p className="mine-note">uploads are tied to this browser; clearing site data loses access</p>}
       {!jobs ? <p className="job-note">loading…</p> : jobs.length === 0 ? <p className="job-note">nothing uploaded yet</p> : (
         <ul className="mine-list">
           {jobs.map((job) => {
             const live = mine.has(job.filmId)
             return (
-              <li key={job.id} data-film={job.filmId} data-state={job.state}>
+              <li key={job.id} data-film={job.filmId} data-state={job.error === 'cancelled' ? 'cancelled' : job.state}>
                 <div className="mine-main">
                   <span className="mine-title">{job.title}</span>
                   <span className="mine-meta">{jobLabel(job, live)} · {when(job.created)}</span>

@@ -122,7 +122,8 @@ canvas { display: block; touch-action: none; }
   font: inherit; font-size: 12px; color: var(--muted); background: none; border: none; padding: 4px 0; cursor: pointer;
 }
 .account-link { letter-spacing: 0.04em; }
-.account-link:hover, .text-button:hover { color: var(--text); }
+.account-link:hover, .account-link[aria-expanded='true'], .text-button:hover { color: var(--text); }
+.account-bar.device { gap: 18px; }
 .text-button:disabled { opacity: 0.5; cursor: default; }
 .text-button.danger { color: var(--error); }
 .account-notice { margin: 0; font-size: 12px; color: var(--faint); }
@@ -226,3 +227,4 @@ canvas { display: block; touch-action: none; }
 .mine-confirm { flex: none; display: flex; gap: 12px; }
 .mine-delete { flex: none; }
 .mine-quota { margin: 0; }
+.mine-note { margin: 0 0 12px; font-size: 12px; line-height: 1.45; color: var(--faint); }

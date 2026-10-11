@@ -9,8 +9,12 @@ The Volume ("vidsearch") holds /videos/<name>.mp4 and /data/films/<id>/... exact
 plus /data/uploads/<job id>/ for the parts of in-flight browser uploads.
 Captions use the "vidsearch-anthropic" secret (ANTHROPIC_API_KEY, VS_CAPTION_MODEL):
     modal secret create vidsearch-anthropic --from-dotenv .env
-Sign-in uses the "vidsearch-auth0" secret (VS_AUTH0_DOMAIN, optionally VS_AUTH0_AUDIENCE):
-    modal secret create vidsearch-auth0 VS_AUTH0_DOMAIN=<tenant>.us.auth0.com
+The Web class uses the "vidsearch-auth0" secret: VS_AUTH0_DOMAIN (absent = no sign-in), optionally
+VS_AUTH0_AUDIENCE, and VS_IP_SALT (random, keeps per-IP upload counts stable across container restarts):
+    modal secret create vidsearch-auth0 VS_IP_SALT=$(openssl rand -hex 16)
+Uploads without sign-in (VS_ANON_UPLOADS=1, set below) tie each upload to a random id the browser keeps.
+Before relying on the per-IP limit, check what Modal's proxy puts in request.client.host and X-Forwarded-For,
+and set VS_CLIENT_IP_HEADER if the client's address is only in a header (README, "Accounts and uploads").
 
 Uploads: the web container stores parts on the Volume, assembles them, commits, and spawns
 `process_job` on a GPU. Job records live in the "vidsearch-jobs" Dict; the web container reads
@@ -76,10 +80,10 @@ class ModalRunner:
 # The host reports 20 cores; pin torch's pools to the 4 reserved so they don't oversubscribe.
 # max_containers=1: an upload's parts arrive as separate requests and are assembled from this
 # container's view of the Volume; a second container wouldn't see parts it hasn't committed and
-# reloaded. One container also makes it the only writer of the per-user quota index.
+# reloaded. One container also makes it the only writer of the quota buckets (per user, per IP, global).
 @app.cls(volumes={VOL: volume}, cpu=float(WEB_CPUS), memory=4096, scaledown_window=600, timeout=600,
          max_containers=1, enable_memory_snapshot=True,
-         env={"OMP_NUM_THREADS": str(WEB_CPUS), "MKL_NUM_THREADS": str(WEB_CPUS)},
+         env={"OMP_NUM_THREADS": str(WEB_CPUS), "MKL_NUM_THREADS": str(WEB_CPUS), "VS_ANON_UPLOADS": "1"},
          secrets=[modal.Secret.from_name("vidsearch-auth0")])
 @modal.concurrent(max_inputs=32)
 class Web:
