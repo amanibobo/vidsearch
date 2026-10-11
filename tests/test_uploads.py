@@ -7,6 +7,7 @@ stays offline and fast. Browser identities (`device:<32 hex>`) are their own bea
 
 import base64
 import json
+import subprocess
 import secrets
 import shutil
 import time
@@ -544,3 +545,41 @@ def test_timed_out_job_leaves_nothing_behind(env):
     assert not (s.films_dir / job.film_id).exists()
     assert not (s.uploads_dir / job.id).exists()
     assert job.film_id not in {f["id"] for f in c.get("/api/library", headers=auth(me)).json()["films"]}
+
+
+def _make_webm_with_audio(path, width=1920, height=1080, seconds=3):
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", f"testsrc2=s={width}x{height}:r=24:d={seconds}",
+                    "-f", "lavfi", "-i", f"sine=f=440:d={seconds}",
+                    "-c:v", "libvpx-vp9", "-deadline", "realtime", "-b:v", "500k", "-c:a", "libopus",
+                    "-shortest", str(path)], check=True)
+
+
+def test_normalize_reencodes_to_browser_safe_mp4(tmp_path):
+    from vidsearch.jobs import _video_info, normalize_video
+
+    src = tmp_path / "clip.webm"
+    _make_webm_with_audio(src)
+    seen = []
+    out = normalize_video(src, 1280, lambda d, t: seen.append((d, t)))
+    info = _video_info(out)
+    assert out == tmp_path / "clip.mp4" and not src.exists()
+    assert info["codec"] == "h264" and info["pix_fmt"] == "yuv420p" and info["mp4"]
+    assert info["width"] == 1280 and not info["audio"]
+    assert seen and seen[-1][0] == seen[-1][1]  # progress reaches its total
+    assert normalize_video(out, 1280) == out  # already compliant: left alone
+
+
+def test_webm_upload_is_converted_before_ingest(env, tmp_path):
+    c, s, clips, kv = env
+    me = device()
+    src = tmp_path / "phone-clip.webm"
+    _make_webm_with_audio(src, width=640, height=360, seconds=4)
+    job = wait_for(c, upload(c, src, me, "Phone Clip"), me)
+    assert job["state"] == "done", job
+    assert job["video"].endswith(".mp4") and (s.videos_dir / job["video"]).exists()
+    assert not (s.videos_dir / job["video"]).with_suffix(".webm").exists()
+    assert "converting" in [st for state, st in kv.history[job["id"]] if state == "processing"]
+    r = c.get(f"/api/video/{job['film_id']}", headers={"Range": "bytes=0-99"})
+    assert r.status_code == 206 and r.headers["content-type"] == "video/mp4"
+    assert c.delete(f"/api/films/{job['film_id']}", headers=auth(me)).status_code == 200

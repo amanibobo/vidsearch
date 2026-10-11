@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import math
 import secrets
 import shutil
@@ -66,7 +67,7 @@ class Job:
     source: Literal["file", "url"]
     video: str                 # file name under Settings.videos_dir
     state: State
-    stage: str | None = None   # downloading, probing, detecting shots, ..., captioning
+    stage: str | None = None   # downloading, probing, converting, detecting shots, ..., captioning
     done: int = 0
     total: int = 0
     error: str | None = None
@@ -259,6 +260,10 @@ def discard(s: Settings, job: Job) -> None:
 # ---------------------------------------------------------------- the job body
 
 
+# Wikimedia (and others) throttle anonymous clients; identify the project as their policies ask.
+USER_AGENT = "vidsearch/1.0 (+https://github.com/amanibobo/vidsearch)"
+
+
 def _refuse_private_hosts(request: httpx.Request) -> None:
     # Runs for the first request and every redirect, so a public URL can't bounce to internal services.
     host = request.url.host
@@ -275,7 +280,8 @@ def download(url: str, dest: Path, max_bytes: int, progress: Callable[[int, int]
     dest.parent.mkdir(parents=True, exist_ok=True)
     too_big = JobError(f"the video is larger than the {max_bytes / 1024**3:g} GB limit")
     try:
-        with httpx.Client(follow_redirects=True, timeout=120, event_hooks={"request": [_refuse_private_hosts]}) as c, \
+        with httpx.Client(follow_redirects=True, timeout=120, headers={"User-Agent": USER_AGENT},
+                          event_hooks={"request": [_refuse_private_hosts]}) as c, \
                 c.stream("GET", url) as r:
             if r.status_code >= 400:
                 raise JobError(f"download failed: HTTP {r.status_code}")
@@ -304,6 +310,49 @@ def check_video(path: Path, max_minutes: float) -> None:
         raise JobError("not a video: ffprobe found no readable video stream") from None
     if duration > max_minutes * 60:
         raise JobError(f"the video is {duration / 60:.1f} min long; the limit is {max_minutes:g} min")
+
+
+def _video_info(path: Path) -> dict:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,codec_name,width,pix_fmt:format=format_name,duration", "-of", "json", str(path)],
+        check=True, capture_output=True, text=True).stdout
+    info = json.loads(out)
+    video = next(st for st in info["streams"] if st.get("codec_type") == "video")
+    return {"codec": video.get("codec_name"), "width": int(video.get("width") or 0), "pix_fmt": video.get("pix_fmt"),
+            "audio": any(st.get("codec_type") == "audio" for st in info["streams"]),
+            "mp4": "mp4" in info["format"].get("format_name", ""), "duration": float(info["format"].get("duration") or 0)}
+
+
+def normalize_video(path: Path, max_width: int, progress: Callable[[int, int], None] = lambda d, t: None) -> Path:
+    """Re-encode to H.264 MP4 (yuv420p, at most max_width wide, no audio, moov first) unless it already is.
+    Browsers then play every source the same way: Safari lacks VP8/VP9/Theora/AV1, and nothing here uses
+    audio (some sources carry music under stricter licences). Returns the final path (always .mp4)."""
+    info = _video_info(path)
+    if (info["codec"] == "h264" and info["pix_fmt"] == "yuv420p" and info["width"] <= max_width
+            and not info["audio"] and info["mp4"] and path.suffix.lower() == ".mp4"):
+        return path
+    out = path.with_suffix(".mp4")
+    tmp = path.with_name(path.stem + ".converting.mp4")
+    total = max(1, int(info["duration"]))
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", str(path), "-map", "0:v:0", "-an", "-sn", "-dn",
+           "-vf", f"scale='min({max_width},trunc(iw/2)*2)':-2", "-c:v", "libx264", "-preset", "veryfast",
+           "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-progress", "pipe:1", str(tmp)]
+    try:
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+            for line in proc.stdout:
+                if line.startswith("out_time_us=") and line.strip() != "out_time_us=N/A":
+                    progress(min(total, int(line.split("=")[1]) // 1_000_000), total)
+            err = proc.stderr.read()
+        if proc.returncode != 0:
+            raise JobError(f"could not convert the video: {err.strip()[-300:] or 'ffmpeg failed'}")
+        tmp.replace(out)
+    finally:
+        tmp.unlink(missing_ok=True)
+    if out != path:
+        path.unlink(missing_ok=True)
+    progress(total, total)
+    return out
 
 
 def run_job(job_id: str, s: Settings, store: JobStore, *, caption: bool = True, embedder=None, captioner=None,
@@ -337,6 +386,13 @@ def run_job(job_id: str, s: Settings, store: JobStore, *, caption: bool = True, 
             sync()
         progress("probing", 0, 1)
         check_video(video, s.max_upload_minutes)
+        progress("converting", 0, 1)
+        converted = normalize_video(video, s.max_video_width, lambda d, t: progress("converting", d, t))
+        if converted != video:
+            video = converted
+            job = replace(job, video=converted.name)
+            store.put(job)
+            sync()
         fid = ingest_video(video, s, title=job.title, owner=job.owner, embedder=embedder,
                            log=log, progress=progress)
         job = replace(job, film_id=fid)

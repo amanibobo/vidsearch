@@ -123,13 +123,13 @@ def _run(job_id: str, caption: bool = True) -> None:
     run_job(job_id, Settings(), JobStore(jobs_dict), caption=caption, sync=volume.commit)
 
 
-@app.function(volumes={VOL: volume}, gpu="L4", timeout=3600,
+@app.function(volumes={VOL: volume}, gpu="L4", cpu=4.0, timeout=3600,  # cores for the re-encode
               secrets=[modal.Secret.from_name("vidsearch-anthropic")])
 def process_job(job_id: str) -> None:
     _run(job_id)
 
 
-@app.function(volumes={VOL: volume}, gpu="L4", timeout=3600,
+@app.function(volumes={VOL: volume}, gpu="L4", cpu=4.0, timeout=3600,  # cores for the re-encode
               secrets=[modal.Secret.from_name("vidsearch-anthropic")])
 def add_film(url: str, name: str, caption: bool = True) -> str:
     """Admin ingest: same job body as uploads, no owner, so the film is public."""
