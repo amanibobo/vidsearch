@@ -3,7 +3,7 @@ videos/
 __pycache__/
 *.pyc
 .env
-.venv/
+.venv
 .DS_Store
 .pytest_cache/
 .vercel/

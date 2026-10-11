@@ -4,6 +4,7 @@ and new clips are ingested and captioned on a GPU without touching this machine.
     modal deploy modal_app.py                                        # API + app at https://<workspace>--vidsearch-traffic-web.modal.run
     modal run modal_app.py::add_film --url <video url> --name "Junction at dusk"  # download, ingest, caption (public)
     modal run modal_app.py::relocate_sources                         # after `modal volume put` from a Mac
+    modal run modal_app.py::sync_media_to_r2                         # upload media not on R2 yet, then serve it from there
 
 Names follow the collection (vidsearch.config.COLLECTIONS; VIDSEARCH_COLLECTION, default traffic): app and Volume
 "vidsearch-<collection>", web label "vidsearch-<collection>-web", Dict "vidsearch-<collection>-jobs".
@@ -14,6 +15,8 @@ Captions use the "vidsearch-anthropic" secret (ANTHROPIC_API_KEY, VS_CAPTION_MOD
 The Web class uses the "vidsearch-auth0" secret: VS_AUTH0_DOMAIN (absent = no sign-in), optionally
 VS_AUTH0_AUDIENCE, and VS_IP_SALT (random, keeps per-IP upload counts stable across container restarts):
     modal secret create vidsearch-auth0 VS_IP_SALT=$(openssl rand -hex 16)
+Videos, atlas pages and frame stills are served from Cloudflare R2 (vidsearch.media) with the "vidsearch-r2"
+secret (R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET), on Web and on every job function.
 Uploads without sign-in (VS_ANON_UPLOADS=1, set below) tie each upload to a random id the browser keeps.
 Before relying on the per-IP limit, check what Modal's proxy puts in request.client.host and X-Forwarded-For,
 and set VS_CLIENT_IP_HEADER if the client's address is only in a header (README, "Accounts and uploads").
@@ -95,7 +98,7 @@ class ModalRunner:
 @app.cls(volumes={VOL: volume}, cpu=float(WEB_CPUS), memory=4096, scaledown_window=600, timeout=600,
          max_containers=1, enable_memory_snapshot=True,
          env={"OMP_NUM_THREADS": str(WEB_CPUS), "MKL_NUM_THREADS": str(WEB_CPUS), "VS_ANON_UPLOADS": "1"},
-         secrets=[modal.Secret.from_name("vidsearch-auth0")])
+         secrets=[modal.Secret.from_name("vidsearch-auth0"), modal.Secret.from_name("vidsearch-r2")])
 @modal.concurrent(max_inputs=32)
 class Web:
     # Importing torch and loading both models takes ~30 s on one core; the snapshot restores them already loaded.
@@ -113,19 +116,21 @@ class Web:
 def _run(job_id: str, caption: bool = True) -> None:
     from vidsearch.config import Settings
     from vidsearch.jobs import JobStore, run_job
+    from vidsearch.media import r2_store
 
     volume.reload()
-    run_job(job_id, Settings(), JobStore(jobs_dict), caption=caption, sync=volume.commit)
+    s = Settings()
+    run_job(job_id, s, JobStore(jobs_dict), caption=caption, sync=volume.commit, r2=r2_store(s))
 
 
 @app.function(volumes={VOL: volume}, gpu="L4", cpu=4.0, timeout=3600,  # cores for the re-encode
-              secrets=[modal.Secret.from_name("vidsearch-anthropic")])
+              secrets=[modal.Secret.from_name("vidsearch-anthropic"), modal.Secret.from_name("vidsearch-r2")])
 def process_job(job_id: str) -> None:
     _run(job_id)
 
 
 @app.function(volumes={VOL: volume}, gpu="L4", cpu=4.0, timeout=3600,  # cores for the re-encode
-              secrets=[modal.Secret.from_name("vidsearch-anthropic")])
+              secrets=[modal.Secret.from_name("vidsearch-anthropic"), modal.Secret.from_name("vidsearch-r2")])
 def add_film(url: str, name: str, caption: bool = True) -> str:
     """Admin ingest: same job body as uploads, no owner, so the film is public."""
     from vidsearch.jobs import JobStore, new_job, url_ext
@@ -156,3 +161,27 @@ def relocate_sources() -> list[str]:
             moved.append(meta["id"])
     volume.commit()
     return moved
+
+
+@app.function(volumes={VOL: volume}, secrets=[modal.Secret.from_name("vidsearch-r2")], timeout=3600)
+def sync_media_to_r2() -> dict:
+    """One-time migration, safe to rerun: publish every film's media that isn't on R2 yet, so the API serves it
+    from there. Running web containers pick the change up on their next library reload (POST /api/reload)."""
+    from vidsearch.config import Settings
+    from vidsearch.media import publish_film, r2_store
+
+    s = Settings()
+    r2 = r2_store(s)
+    if r2 is None:
+        raise RuntimeError("the vidsearch-r2 secret is missing an R2_* setting")
+    counts = {"films": 0, "uploaded": 0, "failed": []}
+    for mp in sorted(s.films_dir.glob("*/film.json")):
+        try:
+            counts["uploaded"] += publish_film(r2, mp.parent)
+            counts["films"] += 1
+        except Exception as e:
+            counts["failed"].append(mp.parent.name)
+            print(f"{mp.parent.name}: {type(e).__name__}: {e}")
+        volume.commit()
+    print(counts)
+    return counts

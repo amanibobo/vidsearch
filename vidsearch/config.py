@@ -123,6 +123,12 @@ class Settings:
     max_upload_minutes: float = field(default_factory=lambda: float(_env("VS_MAX_UPLOAD_MINUTES", "60")))
     upload_part_bytes: int = field(default_factory=lambda: int(_env("VS_UPLOAD_PART_BYTES", str(8 * 1024**2))))
 
+    # Cloudflare R2 bucket for videos, atlas pages and frame stills (vidsearch.media). Any empty = media from disk.
+    r2_account_id: str = field(default_factory=lambda: _env("R2_ACCOUNT_ID", ""))
+    r2_access_key_id: str = field(default_factory=lambda: _env("R2_ACCESS_KEY_ID", ""))
+    r2_secret_access_key: str = field(default_factory=lambda: _env("R2_SECRET_ACCESS_KEY", ""), repr=False)
+    r2_bucket: str = field(default_factory=lambda: _env("R2_BUCKET", ""))
+
     @property
     def films_dir(self) -> Path:
         return self.data_dir / "films"

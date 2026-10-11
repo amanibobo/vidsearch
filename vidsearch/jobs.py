@@ -42,6 +42,7 @@ import httpx
 
 from .config import Settings
 from .ingest import VIDEO_EXTS, Log, probe, slugify
+from .media import R2, delete_film, publish_film
 
 State = Literal["uploading", "queued", "processing", "done", "failed"]
 NEXT: dict[str, set[str]] = {
@@ -67,7 +68,7 @@ class Job:
     source: Literal["file", "url"]
     video: str                 # file name under Settings.videos_dir
     state: State
-    stage: str | None = None   # downloading, probing, converting, detecting shots, ..., captioning
+    stage: str | None = None   # downloading, probing, converting, detecting shots, ..., captioning, publishing
     done: int = 0
     total: int = 0
     error: str | None = None
@@ -248,11 +249,13 @@ def assemble(s: Settings, job: Job) -> None:
     shutil.rmtree(parts_dir(s, job.id), ignore_errors=True)
 
 
-def discard(s: Settings, job: Job) -> None:
-    """Delete what a failed or cancelled job left on disk: upload parts, and for a user's job its video and
-    film dir (an admin's video may predate the job, so it stays). Safe to repeat."""
+def discard(s: Settings, job: Job, r2: R2 | None = None) -> None:
+    """Delete what a failed or cancelled job left on disk and in R2: upload parts, and for a user's job its video
+    and film media (an admin's video may predate the job, so it stays). Safe to repeat."""
     shutil.rmtree(parts_dir(s, job.id), ignore_errors=True)
     if job.owner:
+        if r2:
+            delete_film(r2, job.film_id, job.video)
         (s.videos_dir / job.video).unlink(missing_ok=True)
         shutil.rmtree(s.films_dir / job.film_id, ignore_errors=True)
 
@@ -356,9 +359,11 @@ def normalize_video(path: Path, max_width: int, progress: Callable[[int, int], N
 
 
 def run_job(job_id: str, s: Settings, store: JobStore, *, caption: bool = True, embedder=None, captioner=None,
-            text_embedder=None, sync: Callable[[], None] = lambda: None, log: Log = print) -> None:
-    """Download (URL jobs), probe, ingest and caption one job, recording progress in the store.
-    sync publishes written files to other containers (volume.commit on Modal).
+            text_embedder=None, sync: Callable[[], None] = lambda: None, log: Log = print,
+            r2: R2 | None = None) -> None:
+    """Download (URL jobs), probe, ingest, caption and publish one job, recording progress in the store.
+    sync publishes written files to other containers (volume.commit on Modal); r2 is where the film's media
+    is published for serving (None = served from disk).
     Safe to rerun: finished jobs are left alone, and ingest/captions resume from what's on disk."""
     from .caption import caption_film
     from .ingest import ingest_video
@@ -408,11 +413,21 @@ def run_job(job_id: str, s: Settings, store: JobStore, *, caption: bool = True, 
                 note = f"captions skipped: {e}"
                 log(f"[{fid}] {note}")
             sync()
+        if r2:
+            # The film is complete on disk and served from there until this succeeds, so a failure is a note.
+            progress("publishing", 0, 0)
+            try:
+                publish_film(r2, s.films_dir / fid, lambda d, t: progress("publishing", d, t))
+                sync()
+            except Exception as e:
+                problem = f"media not published to R2: {type(e).__name__}: {e}"
+                note = f"{note}; {problem}" if note else problem
+                log(f"[{fid}] {problem}")
         store.put(advance(job, "done", stage=None, done=0, total=0, error=note))
     except Exception as e:
         msg = str(e) if isinstance(e, JobError) else f"processing failed: {type(e).__name__}: {e}"
         log(f"[job {job.id}] {msg}")
-        discard(s, job)
+        discard(s, job, r2)
         sync()
         store.put(advance(job, "failed", error=msg))
 

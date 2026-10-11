@@ -3,6 +3,7 @@ pillow
 scenedetect
 opencv-python-headless
 httpx
+boto3           # media on Cloudflare R2 (vidsearch.media)
 anthropic       # only for claude-* caption models
 fastapi
 uvicorn

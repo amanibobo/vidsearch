@@ -189,12 +189,23 @@ this if it matters later.
 ```bash
 modal secret create vidsearch-anthropic --from-dotenv .env         # ANTHROPIC_API_KEY, VS_CAPTION_MODEL
 modal secret create vidsearch-auth0 VS_IP_SALT=$(openssl rand -hex 16)  # add VS_AUTH0_DOMAIN once Auth0 is set up
+modal secret create vidsearch-r2 --from-dotenv .env                # R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
 modal deploy modal_app.py                                                      # https://<workspace>--vidsearch-traffic-web.modal.run
 modal run modal_app.py::add_film --url <video url> --name "Junction at dusk"   # admin: a public clip
 modal volume put vidsearch-traffic data/films/<id> /data/films/<id>            # or after a local ingest
 modal volume put vidsearch-traffic videos/<file>.mp4 /videos/<file>.mp4
 modal run modal_app.py::relocate_sources
+modal run modal_app.py::sync_media_to_r2                                       # once: copy existing media to R2, then POST /api/reload
 ```
+
+**Media on R2.** With the `R2_*` settings present, videos, atlas pages and frame stills live in a Cloudflare
+R2 bucket under the same layout (`videos/<file>`, `films/<id>/atlas/NNN.jpg`, `films/<id>/frames/NNNNNN.jpg`).
+Each job's last stage, `publishing`, uploads them (16 at a time, skipping objects already there with the same
+size) and marks the film's `film.json` with `"media": "r2"`. For a marked film, `/api/video/{id}` and
+`/media/{id}/...` answer `302` to a presigned GET URL that is the same for the whole UTC hour and valid until an
+hour after it, with `Cache-Control: private, max-age=<seconds left in the hour>`. Unmarked films are served from
+disk as before. Deleting a film and reaping a timed-out job delete its objects too. If publishing fails, the job
+still finishes, with a note, and the film is served from disk.
 
 **Collections.** `COLLECTIONS` in `vidsearch/config.py` holds each archive's defaults, and
 `VIDSEARCH_COLLECTION` picks one at deploy time (unset or empty means `traffic`, the only one today).

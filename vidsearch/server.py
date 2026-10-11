@@ -8,6 +8,7 @@
     GET    /api/video/{film_id}         the source video (supports Range, so <video> can seek)
     POST   /api/reload                  pick up newly ingested / captioned films
     GET    /media/{film_id}/...         frames/*.jpg and atlas/*.jpg
+                                        (video and media: a 302 to a presigned R2 URL once the film is on R2)
 
   signed in (Authorization: Bearer <Auth0 access token>, or device:<32 hex> with VS_ANON_UPLOADS=1):
     POST   /api/uploads                 {title, filename, size} -> {upload_id, part_size}
@@ -38,7 +39,7 @@ from typing import Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -48,6 +49,7 @@ from .config import Settings
 from .jobs import (TIMED_OUT, Job, JobError, LocalRunner, QuotaExceeded, Runner, advance, assemble, discard, hash_ip,
                    new_job, parts_dir, upload_quotas, url_ext, user_bucket, write_part)
 from .library import Library
+from .media import R2, film_prefix, on_r2, r2_store, video_key, delete_film as delete_r2_film
 
 settings = Settings()
 log = logging.getLogger("vidsearch.server")
@@ -71,12 +73,14 @@ class UrlUpload(BaseModel):
 def create_app(lib: Library | None = None, s: Settings | None = None,
                before_reload: Callable[[], None] | None = None,
                after_write: Callable[[], None] | None = None,
-               runner: Runner | None = None) -> FastAPI:
+               runner: Runner | None = None, r2: R2 | None = None) -> FastAPI:
     """before_reload runs ahead of every library reload, e.g. to pull a remote volume's latest commit.
     after_write runs after the API writes files other processes need (assembled uploads, deletes),
-    e.g. a volume commit. runner runs upload jobs; default is a background thread in this process."""
+    e.g. a volume commit. runner runs upload jobs; default is a background thread in this process.
+    r2 serves and deletes published media; default is the bucket the settings name, if any."""
     s = s or settings
-    runner = runner or LocalRunner(s)
+    r2 = r2 or r2_store(s)
+    runner = runner or LocalRunner(s, r2=r2)
     jobs = runner.store
     optional_user, required_user = user_dependencies(s)
     reload_lock = threading.Lock()
@@ -119,7 +123,7 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
         done = [j for j in seen if j.state == "done" and j.id not in picked_up]
         dead = [j for j in seen if j.state == "failed" and j.error == TIMED_OUT and j.id not in reaped]
         for j in dead:
-            discard(s, j)
+            discard(s, j, r2)
         if dead and after_write:
             after_write()
         if any(j.film_id not in L().by_id for j in done) or any(j.film_id in L().by_id for j in dead):
@@ -185,12 +189,22 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
 
     # Media and video stay unauthenticated: <video> and WebGL texture loads can't send an
     # Authorization header. A private film is protected by its unguessable id instead.
+    def to_r2(key: str) -> RedirectResponse:
+        url, max_age = r2.presign(key)
+        return RedirectResponse(url, 302, headers={"Cache-Control": f"private, max-age={max_age}"})
+
+    def on_r2_film(film_id: str) -> bool:
+        lib = L()
+        return bool(r2) and film_id in lib.by_id and on_r2(lib.films[lib.by_id[film_id]].meta)
+
     @app.get("/api/video/{film_id}")
     def video(film_id: str):
         lib = L()
         if film_id not in lib.by_id:
             raise HTTPException(404, "unknown film")
         src = Path(lib.films[lib.by_id[film_id]].meta["source"])
+        if on_r2_film(film_id):
+            return to_r2(video_key(src.name))
         if not src.exists():
             raise HTTPException(404, f"source video moved or missing: {src}")
         return FileResponse(src)
@@ -292,6 +306,8 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
             raise HTTPException(403, "public films can't be deleted through the API")
         if owner != user:
             raise HTTPException(403, "not your film")
+        if r2:
+            delete_r2_film(r2, film_id, Path(film.meta["source"]).name)
         shutil.rmtree(film.dir)
         Path(film.meta["source"]).unlink(missing_ok=True)
         if after_write:
@@ -306,6 +322,18 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
         if request.url.path.startswith(("/media/", "/api/video/")) and response.status_code in (200, 206):
             response.headers.setdefault("Cache-Control", "public, max-age=86400")
         return response
+
+    # Ahead of the /media mount, which serves whatever isn't on R2 from disk.
+    @app.get("/media/{film_id}/{kind}/{name}")
+    def media_file(film_id: str, kind: str, name: str):
+        if kind not in ("atlas", "frames") or not re.fullmatch(r"\d+\.jpg", name) or film_id in (".", ".."):
+            raise HTTPException(404, "Not Found")
+        if on_r2_film(film_id):
+            return to_r2(f"{film_prefix(film_id)}{kind}/{name}")
+        path = s.films_dir / film_id / kind / name
+        if not path.is_file():
+            raise HTTPException(404, "Not Found")
+        return FileResponse(path)
 
     s.films_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/media", StaticFiles(directory=s.films_dir), name="media")
