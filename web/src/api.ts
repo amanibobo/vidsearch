@@ -236,7 +236,8 @@ export interface Identity { title: string; noun: string; nounPlural: string }
  */
 export const FALLBACK_IDENTITY: Identity = { title: String(import.meta.env.VITE_ARCHIVE_TITLE || document.title), noun: 'clip', nounPlural: 'clips' }
 
-export interface Archive { films: Film[]; uploads: UploadsMode; identity: Identity }
+/** `voice`: the API can mint voice search tokens (it has an ElevenLabs key), so the pill offers the mic. */
+export interface Archive { films: Film[]; uploads: UploadsMode; identity: Identity; voice: boolean }
 
 function parseIdentity(v: unknown): Identity {
   const a = obj(v, 'library.archive')
@@ -252,7 +253,16 @@ export async function fetchLibrary(signal: AbortSignal): Promise<Archive> {
     films: arr(body.films, 'library.films').map(parseFilm),
     uploads: mode as UploadsMode,
     identity: body.archive === undefined ? FALLBACK_IDENTITY : parseIdentity(body.archive),
+    voice: body.voice === undefined ? false : bool(obj(body.voice, 'library.voice').available, 'voice.available'),
   }
+}
+
+/** A single-use ElevenLabs realtime token. Not retried: each one spends the archive's voice credits. */
+export async function fetchVoiceToken(signal: AbortSignal): Promise<string> {
+  const url = api('/api/voice/token')
+  const res = await authed((headers) => fetch(url, { signal, headers }))
+  if (!res.ok) throw await httpError(res, url)
+  return str(obj(await res.json(), 'voice').token, 'voice.token')
 }
 
 export async function runSearch(query: string, signal: AbortSignal): Promise<Extract<Search, { status: 'ready' }>> {

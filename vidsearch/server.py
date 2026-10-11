@@ -2,7 +2,10 @@
 
     GET    /api/library                 films the caller can see, shot boundaries, atlas layout + urls,
                                         `uploads`: {mode: off | device | account, limits},
-                                        and `archive`: {title, noun, noun_plural} (what to call it and its items)
+                                        `archive`: {title, noun, noun_plural} (what to call it and its items),
+                                        and `voice`: {available} (whether /api/voice/token can mint)
+    GET    /api/voice/token             {token, expires_in}: a single-use ElevenLabs realtime speech-to-text token.
+                                        503 without ELEVENLABS_API_KEY, 429 over a limit, 502 if ElevenLabs fails
     GET    /api/search?q=...&k=24       ranked moments (film, timestamp, best frame, atlas cell...)
     GET    /api/heatmap?q=...           per-frame relevance for every visible film (glowing strip ticks)
     GET    /api/video/{film_id}         the source video (supports Range, so <video> can seek)
@@ -48,6 +51,7 @@ from .config import Settings
 from .jobs import (TIMED_OUT, Job, JobError, LocalRunner, QuotaExceeded, Runner, advance, assemble, discard, hash_ip,
                    new_job, parts_dir, upload_quotas, url_ext, user_bucket, write_part)
 from .library import Library
+from .voice import TOKEN_TTL_S, ElevenLabsMinter, RateLimited, SlidingLimiter, TokenMinter, VoiceUnavailable, voice_windows
 
 settings = Settings()
 log = logging.getLogger("vidsearch.server")
@@ -71,10 +75,11 @@ class UrlUpload(BaseModel):
 def create_app(lib: Library | None = None, s: Settings | None = None,
                before_reload: Callable[[], None] | None = None,
                after_write: Callable[[], None] | None = None,
-               runner: Runner | None = None) -> FastAPI:
+               runner: Runner | None = None, minter: TokenMinter | None = None) -> FastAPI:
     """before_reload runs ahead of every library reload, e.g. to pull a remote volume's latest commit.
     after_write runs after the API writes files other processes need (assembled uploads, deletes),
-    e.g. a volume commit. runner runs upload jobs; default is a background thread in this process."""
+    e.g. a volume commit. runner runs upload jobs; default is a background thread in this process.
+    minter mints voice tokens; default is ElevenLabs when ELEVENLABS_API_KEY is set, else voice search is off."""
     s = s or settings
     runner = runner or LocalRunner(s)
     jobs = runner.store
@@ -87,13 +92,15 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
     ip_salt = s.ip_salt
     if not ip_salt:
         ip_salt = secrets.token_hex(16)
-        if s.anon_uploads:
-            log.warning("VS_IP_SALT is empty: per-IP upload counts use a random salt and reset when this process restarts")
+        if s.anon_uploads or s.elevenlabs_api_key:
+            log.warning("VS_IP_SALT is empty: per-IP upload and voice counts use a random salt and reset when this process restarts")
     limits = {"uploads_per_day": s.uploads_per_day, "uploads_per_ip_per_day": s.uploads_per_ip_per_day,
               "uploads_global_per_day": s.uploads_global_per_day, "max_bytes": s.max_upload_bytes,
               "max_minutes": s.max_upload_minutes, "part_size": s.upload_part_bytes}
     uploads = {"mode": uploads_mode(s), "limits": limits}
     archive = {"title": s.archive_title, "noun": s.item_noun, "noun_plural": s.item_noun_plural}
+    minter = minter or (ElevenLabsMinter(s.elevenlabs_api_key) if s.elevenlabs_api_key else None)
+    voice_limiter = SlidingLimiter()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -154,7 +161,7 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
     def library(user: str | None = Depends(optional_user)):
         if user:  # a few recent jobs is enough: each is a store read (a modal.Dict call on Modal)
             observe(jobs.for_owner(user, limit=5))
-        return {**L().library_json(user), "uploads": uploads, "archive": archive}
+        return {**L().library_json(user), "uploads": uploads, "archive": archive, "voice": {"available": minter is not None}}
 
     @app.get("/api/search")
     def search(
@@ -178,6 +185,19 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
         if heatmap:
             out["heatmap"] = L().heatmap(q, user)
         return out
+
+    @app.get("/api/voice/token")
+    def voice_token(request: Request, user: str | None = Depends(optional_user)):
+        if minter is None:
+            raise HTTPException(503, "voice search not configured")
+        try:
+            voice_limiter.take(voice_windows(s, user, hash_ip(client_ip(request), ip_salt)), time.time())
+        except RateLimited as e:
+            raise HTTPException(429, str(e)) from None
+        try:
+            return {"token": minter.mint(), "expires_in": TOKEN_TTL_S}
+        except VoiceUnavailable as e:
+            raise HTTPException(502, str(e)) from None
 
     @app.get("/api/heatmap")
     def heatmap(q: str = Query(..., min_length=1), user: str | None = Depends(optional_user)):

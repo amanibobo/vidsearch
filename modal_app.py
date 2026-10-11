@@ -14,6 +14,8 @@ Captions use the "vidsearch-anthropic" secret (ANTHROPIC_API_KEY, VS_CAPTION_MOD
 The Web class uses the "vidsearch-auth0" secret: VS_AUTH0_DOMAIN (absent = no sign-in), optionally
 VS_AUTH0_AUDIENCE, and VS_IP_SALT (random, keeps per-IP upload counts stable across container restarts):
     modal secret create vidsearch-auth0 VS_IP_SALT=$(openssl rand -hex 16)
+Voice search uses the "vidsearch-elevenlabs" secret (ELEVENLABS_API_KEY); the key stays on the server:
+    modal secret create vidsearch-elevenlabs ELEVENLABS_API_KEY=...
 Uploads without sign-in (VS_ANON_UPLOADS=1, set below) tie each upload to a random id the browser keeps.
 Before relying on the per-IP limit, check what Modal's proxy puts in request.client.host and X-Forwarded-For,
 and set VS_CLIENT_IP_HEADER if the client's address is only in a header (README, "Accounts and uploads").
@@ -95,7 +97,7 @@ class ModalRunner:
 @app.cls(volumes={VOL: volume}, cpu=float(WEB_CPUS), memory=4096, scaledown_window=600, timeout=600,
          max_containers=1, enable_memory_snapshot=True,
          env={"OMP_NUM_THREADS": str(WEB_CPUS), "MKL_NUM_THREADS": str(WEB_CPUS), "VS_ANON_UPLOADS": "1"},
-         secrets=[modal.Secret.from_name("vidsearch-auth0")])
+         secrets=[modal.Secret.from_name("vidsearch-auth0"), modal.Secret.from_name("vidsearch-elevenlabs")])
 @modal.concurrent(max_inputs=32)
 class Web:
     # Importing torch and loading both models takes ~30 s on one core; the snapshot restores them already loaded.

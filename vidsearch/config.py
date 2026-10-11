@@ -119,6 +119,12 @@ class Settings:
     client_ip_header: str = field(default_factory=lambda: _env("VS_CLIENT_IP_HEADER", ""))
     # Client IPs are only stored as sha256(salt, ip). "" = a random salt per process, so per-IP counts reset on restart.
     ip_salt: str = field(default_factory=lambda: _env("VS_IP_SALT", ""))
+    # Voice search: the server mints single-use ElevenLabs realtime speech-to-text tokens; the key never leaves it.
+    # Empty = no voice search (the frontend hides the mic). Token limits protect the account's credits.
+    elevenlabs_api_key: str = field(default_factory=lambda: _env("ELEVENLABS_API_KEY", ""))
+    voice_tokens_per_user_per_hour: int = field(default_factory=lambda: int(_env("VS_VOICE_PER_USER_PER_HOUR", "20")))
+    voice_tokens_per_ip_per_hour: int = field(default_factory=lambda: int(_env("VS_VOICE_PER_IP_PER_HOUR", "20")))
+    voice_tokens_global_per_day: int = field(default_factory=lambda: int(_env("VS_VOICE_GLOBAL_PER_DAY", "200")))
     max_upload_bytes: int = field(default_factory=lambda: int(_env("VS_MAX_UPLOAD_BYTES", str(2 * 1024**3))))
     max_upload_minutes: float = field(default_factory=lambda: float(_env("VS_MAX_UPLOAD_MINUTES", "60")))
     upload_part_bytes: int = field(default_factory=lambda: int(_env("VS_UPLOAD_PART_BYTES", str(8 * 1024**2))))
