@@ -312,7 +312,7 @@ def create_app(lib: Library | None = None, s: Settings | None = None,
     if s.web_dist:
         @app.get("/", include_in_schema=False)
         def index_page():
-            # The tab and masthead name this archive before /api/library answers (the build's own title is Keaton's).
+            # The tab and masthead name this archive before /api/library answers (VS_ARCHIVE_TITLE may differ from the build's).
             page = (Path(s.web_dist) / "index.html").read_text()
             title = f"<title>{html.escape(s.archive_title)}</title>"
             return HTMLResponse(re.sub(r"<title>.*?</title>", lambda _: title, page, count=1))

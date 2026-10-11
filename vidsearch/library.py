@@ -5,7 +5,7 @@ three signals, then de-duplicated so you don't get five hits from the same two s
 
     frames    SigLIP query vs every sampled frame        (objects, people, settings)
     windows   SigLIP query vs mean of ~3 s of frames     (smoother, a bit of temporal context)
-    captions  text query vs VLM shot captions (optional) (actions, narrative: "being chased")
+    captions  text query vs VLM shot captions (optional) (actions: "running a red light")
 """
 
 from __future__ import annotations

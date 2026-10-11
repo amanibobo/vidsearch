@@ -1,11 +1,12 @@
 # vidsearch
 
-Semantic "find the moment" search over a video library: type *being chased* and get back
-timestamps across every film, plus everything a frontend needs to draw the whole archive as
-filmstrips (thumbnail atlases, shot boundaries, per-frame relevance heatmaps).
+Semantic "find the moment" search over dashcam and traffic-camera footage: type *cyclist crossing
+at night* and get back timestamps across every clip, plus everything a frontend needs to draw the
+whole archive as filmstrips (thumbnail atlases, shot boundaries, per-frame relevance heatmaps).
+The live deployment is The Traffic Archive; anyone can search it and upload their own clips.
 
 ```
-video ─► shots (PySceneDetect) ─► frames @1fps ─► SigLIP 2 frame embeddings ─┬─► index: frames
+video ─► shots (PySceneDetect) ─► frames @2fps ─► SigLIP 2 frame embeddings ─┬─► index: frames
                                       │                                      └─► index: 3s windows (mean-pooled)
                                       ├─► thumbnail atlases (for the 3D view)
                                       └─► [optional] VLM shot captions ─► bge embeddings ─► index: captions
@@ -13,8 +14,8 @@ video ─► shots (PySceneDetect) ─► frames @1fps ─► SigLIP 2 frame emb
 query ─► SigLIP text + bge text ─► search all three ─► reciprocal-rank fusion ─► de-dupe in time ─► moments
 ```
 
-Frame embeddings are good at *things* (a streetcar, a crowd, a bride). Captions are what make
-*actions* work ("being chased", "falls off a ladder"), since one frame can't show motion.
+Frame embeddings are good at *things* (a school bus, a cyclist, a wet road at night). Captions are
+what make *actions* work ("running a red light", "car cutting in"), since one frame can't show motion.
 Search fuses both, so the caption step is optional but recommended.
 
 ## Setup
@@ -31,7 +32,8 @@ Hugging Face.
 ## Quickstart
 
 ```bash
-# 1. put videos in ./videos (Keaton's 1920s features are public domain on archive.org)
+# 1. put dashcam or traffic-camera videos in ./videos
+#    (CC-licensed dashcam drives are on the Internet Archive and Wikimedia Commons)
 python -m vidsearch ingest videos/
 
 # 2. optional, recommended: caption every shot with a vision LLM
@@ -39,19 +41,20 @@ export VS_CAPTION_API_KEY=...            # see "Caption providers" below
 python -m vidsearch caption
 
 # 3. try it
-python -m vidsearch search "being chased"
-python -m vidsearch search "a streetcar" -k 5
+python -m vidsearch search "cyclist crossing at night"
+python -m vidsearch search "a school bus" -k 5
 
 # 4. serve the API for the frontend
 python -m vidsearch serve                # http://127.0.0.1:8000/docs
 ```
 
-Ingest is per film and skips films already done (`--force` redoes one). Captioning is
+Ingest is per clip and skips clips already done (`--force` redoes one). Captioning is
 resumable: it logs progress to `captions.jsonl`, so rerunning picks up where it stopped and
 retries failures. After ingesting or captioning while the server is running, `POST /api/reload`.
 
-Rough cost, as a ballpark: on a laptop GPU / Apple Silicon: a 60-min film is ~3,600 frames, about 1–3 min to
-embed. On CPU it's more like 10–15 min. Captioning a feature film is ~400–600 chunks.
+Rough cost, as a ballpark: an hour of footage at the default 2 fps is ~7,200 frames, about 2–6 min to embed on a
+laptop GPU / Apple Silicon and more like 20–30 min on CPU. Captioning sends one request per shot chunk (12 s at
+most), so an hour is at least 300 requests.
 
 ## Caption providers
 
@@ -74,8 +77,8 @@ Each chunk sends up to 4 frames from one shot (long shots are split into 12 s ch
 
 | Route | Returns |
 |---|---|
-| `GET /api/library` | films the caller can see: title, duration, `n_frames`, `sample_fps`, `shots`, `atlas` layout + `urls`, `video_url`, `owner_is_you`. Also `uploads`: `{mode, limits}`, where `mode` is `off`, `device` or `account` (below) |
-| `GET /api/search?q=being+chased&k=24` | ranked moments (below). Optional `films=id1,id2`, `gap=` (sec), `use=frame,window,caption` |
+| `GET /api/library` | clips (`films`) the caller can see: title, duration, `n_frames`, `sample_fps`, `shots`, `atlas` layout + `urls`, `video_url`, `owner_is_you`. Also `uploads`: `{mode, limits}`, where `mode` is `off`, `device` or `account` (below) |
+| `GET /api/search?q=cyclist+crossing+at+night&k=24` | ranked moments (below). Optional `films=id1,id2`, `gap=` (sec), `use=frame,window,caption` |
 | `GET /api/heatmap?q=...` | per visible film, base64 `uint8` per sampled frame (0–255 relevance) |
 | `GET /api/video/{id}` | source video with Range support, so `<video>` can seek |
 | `GET /media/{id}/frames/000123.jpg` | sampled frame (384 px wide) |
@@ -152,7 +155,7 @@ A job record, from `GET /api/jobs/{id}`:
 
 ```jsonc
 {
-  "id": "5f0c…", "owner": "auth0|abc", "title": "My Film", "film_id": "my-film-3fa9c1d2e4b7",
+  "id": "5f0c…", "owner": "auth0|abc", "title": "My Commute", "film_id": "my-commute-3fa9c1d2e4b7",
   "source": "file",            // or "url"
   "state": "processing",       // uploading -> queued -> processing -> done; failed can follow any state but done
   "stage": "embedding",        // downloading, probing, detecting shots, sampling frames, building atlas, embedding, captioning
@@ -160,7 +163,7 @@ A job record, from `GET /api/jobs/{id}`:
   "error": null,               // failed: why, for the uploader. done: set if captions were skipped
   "created": 1791670000.0,      // when the upload started
   "updated": 1791670420.0,      // last state or progress write
-  "video": "my-film-3fa9c1d2e4b7.mp4", "url": null, "size": 734003200
+  "video": "my-commute-3fa9c1d2e4b7.mp4", "url": null, "size": 734003200
 }
 ```
 
@@ -175,7 +178,7 @@ URL downloads stop at 2 GB and refuse hosts that resolve to private addresses.
 **Privacy tradeoff.** `/media/...` and `/api/video/...` have no auth check, because `<video>`
 elements and WebGL texture loads can't send an `Authorization` header. A private film is
 protected only by its id: the title's slug plus 12 random hex characters (48 bits), e.g.
-`my-film-3fa9c1d2e4b7`. Anyone who learns the id, say from a shared frame URL, can fetch that
+`my-commute-3fa9c1d2e4b7`. Anyone who learns the id, say from a shared frame URL, can fetch that
 film's frames and video, but can't list, search or delete it. Signed media URLs would close
 this if it matters later.
 
@@ -186,47 +189,37 @@ this if it matters later.
 ```bash
 modal secret create vidsearch-anthropic --from-dotenv .env         # ANTHROPIC_API_KEY, VS_CAPTION_MODEL
 modal secret create vidsearch-auth0 VS_IP_SALT=$(openssl rand -hex 16)  # add VS_AUTH0_DOMAIN once Auth0 is set up
-modal deploy modal_app.py
-modal run modal_app.py::add_film --url <video url> --name "Cops"  # admin: a public film
+modal deploy modal_app.py                                                      # https://<workspace>--vidsearch-traffic-web.modal.run
+modal run modal_app.py::add_film --url <video url> --name "Junction at dusk"   # admin: a public clip
+modal volume put vidsearch-traffic data/films/<id> /data/films/<id>            # or after a local ingest
+modal volume put vidsearch-traffic videos/<file>.mp4 /videos/<file>.mp4
+modal run modal_app.py::relocate_sources
 ```
 
-**Collections.** One codebase serves several archives, each a separate deployment with its own URL, Volume,
-job records and title. `VIDSEARCH_COLLECTION` picks one at deploy time from `COLLECTIONS` in
-`vidsearch/config.py`; unset (or `keaton`) is the original Keaton archive, with every name unchanged:
+**Collections.** `COLLECTIONS` in `vidsearch/config.py` holds each archive's defaults, and
+`VIDSEARCH_COLLECTION` picks one at deploy time (unset or empty means `traffic`, the only one today).
+Another archive would be another entry there and a separate deployment with its own names:
 
 | Collection | Title | Items | Captions (`caption.PROMPTS`) | Sample fps | SigLIP query templates |
 |---|---|---|---|---|---|
-| `keaton` (default) | The Keaton Archive | film / films | `film` | 1 | `{}`, `a film still of {}`, `a black and white movie scene of {}` |
-| `traffic` | The Traffic Archive | clip / clips | `driving` | 2 | `{}`, `a dashcam photo of {}`, `a traffic camera image of {}` |
+| `traffic` (default) | The Traffic Archive | clip / clips | `driving` | 2 | `{}`, `a dashcam photo of {}`, `a traffic camera image of {}` |
 
 | Collection | Modal app and Volume | Web label (URL) | Jobs Dict |
 |---|---|---|---|
-| `keaton` | `vidsearch` | `vidsearch-web` | `vidsearch-jobs` |
 | `traffic` | `vidsearch-traffic` | `vidsearch-traffic-web` | `vidsearch-traffic-jobs` |
 
-```bash
-modal deploy modal_app.py                                                      # Keaton
-VIDSEARCH_COLLECTION=traffic modal deploy modal_app.py                         # https://<workspace>--vidsearch-traffic-web.modal.run
-VIDSEARCH_COLLECTION=traffic modal run modal_app.py::add_film --url <video url> --name "Junction at dusk"
-modal volume put vidsearch-traffic data/films/<id> /data/films/<id>            # after a local ingest:
-modal volume put vidsearch-traffic videos/<file>.mp4 /videos/<file>.mp4        #   VIDSEARCH_COLLECTION=traffic python -m vidsearch ingest ...
-VIDSEARCH_COLLECTION=traffic modal run modal_app.py::relocate_sources
-```
-
-Both collections share the `vidsearch-anthropic` and `vidsearch-auth0` secrets, the upload limits and browser ids.
 The deploy bakes `VIDSEARCH_COLLECTION` into the image, so containers derive the same names and defaults.
-Locally, `VIDSEARCH_COLLECTION=traffic` sets the same defaults (use a separate `VS_DATA` and `VS_VIDEOS`).
 `/api/library` returns the title and nouns as `archive: {title, noun, noun_plural}`, and the API rewrites the
-`<title>` of the page it serves, so the frontend build is the same for every collection.
+`<title>` of the page it serves, so `VS_ARCHIVE_TITLE` and friends reach the frontend without a rebuild.
 
-The `vidsearch` Volume holds `/videos` and `/data`, the same layout as local. The `Web` class
+The `vidsearch-traffic` Volume holds `/videos` and `/data`, the same layout as local. The `Web` class
 writes upload parts to the Volume, assembles them, commits, and spawns `process_job` on an L4
 GPU. That function reloads the Volume, runs the same job body as local (download, probe,
 ingest, caption) and commits after ingest and after captions. Job records live in the
-`vidsearch-jobs` Dict, so the web container can report progress it didn't compute. `Web` runs
+`vidsearch-traffic-jobs` Dict, so the web container can report progress it didn't compute. `Web` runs
 with `max_containers=1`: all parts of an upload must land in one container's view of the
 Volume, and one container is the only writer of the per-user quota index. `add_film` uses the
-same job body with no owner, so its films stay public. `Web` sets `VS_ANON_UPLOADS=1`, so uploads
+same job body with no owner, so its clips stay public. `Web` sets `VS_ANON_UPLOADS=1`, so uploads
 work without sign-in; the per-IP limit needs the proxy check above.
 
 A search result:
@@ -234,19 +227,19 @@ A search result:
 ```jsonc
 {
   "rank": 0,
-  "film_id": "seven-chances",
-  "title": "Seven Chances",
-  "t": 2572.0,                 // best-matching frame in the moment (seconds)
-  "start": 2570.0, "end": 2573.0,
-  "frame": 2572,               // sampled-frame index within the film
-  "frame_range": [2570, 2573],
-  "shot": 412, "shot_range": [2566.4, 2581.9],
+  "film_id": "bristol-downtown",
+  "title": "Bristol Downtown",
+  "t": 41.5,                   // best-matching frame in the moment (seconds)
+  "start": 40.0, "end": 43.0,
+  "frame": 83,                 // sampled-frame index within the clip (2 per second)
+  "frame_range": [80, 86],
+  "shot": 3, "shot_range": [38.2, 52.0],
   "similarity": 0.142,         // SigLIP cosine of the best frame (SigLIP scores run low; compare relatively)
   "score": 0.0412,             // fused rank score used for ordering
   "sources": {"frame": 3, "window": 0, "caption": 1},   // rank within each signal
-  "caption": "A man runs down a street pursued by a crowd of women in wedding dresses.",
-  "frame_url": "/media/seven-chances/frames/002572.jpg",
-  "atlas": {"page": 1, "col": 20, "row": 0}
+  "caption": "A white SUV turns left across the intersection while a cyclist waits at the crosswalk.",
+  "frame_url": "/media/bristol-downtown/frames/000083.jpg",
+  "atlas": {"page": 0, "col": 41, "row": 1}
 }
 ```
 
@@ -263,7 +256,7 @@ See `web/README.md` for the build and the browser verification script.
 
 ## Drawing it in the frontend
 
-**Filmstrips.** Each film is `n_frames` cells. Cell `i` lives at
+**Filmstrips.** Each clip is `n_frames` cells. Cell `i` lives at
 `page = floor(i / per_page)`, `k = i % per_page`, `col = k % cols`, `row = floor(k / cols)`.
 In three.js, use one `InstancedMesh` per atlas page and set a per-instance UV offset:
 
@@ -271,7 +264,7 @@ In three.js, use one `InstancedMesh` per atlas page and set a per-instance UV of
 const u0 = col * cell_w / texW, v0 = 1 - (row + 1) * cell_h / texH;   // texture's actual size
 ```
 
-Lay film `j` out as a column at `x = j * gap`, with frame `i` at `y = -i * cellHeight`, tilt the
+Lay clip `j` out as a column at `x = j * gap`, with frame `i` at `y = -i * cellHeight`, tilt the
 camera back, and fade with distance. The search result's `atlas` field points straight at
 the matching cell.
 
@@ -292,12 +285,12 @@ All settings are environment variables (`vidsearch/config.py`):
 | Var | Default | Notes |
 |---|---|---|
 | `VS_DATA` | `data` | output dir |
-| `VIDSEARCH_COLLECTION` | `keaton` | which collection's defaults below apply (see "Collections") |
-| `VS_SAMPLE_FPS` | per collection (`1.0`, traffic `2.0`) | 2.0 catches quick gags; doubles embed time |
-| `VS_CAPTION_STYLE` | per collection (`film`, traffic `driving`) | which caption prompt (`caption.PROMPTS`) |
+| `VIDSEARCH_COLLECTION` | `traffic` | which collection's defaults below apply (see "Collections") |
+| `VS_SAMPLE_FPS` | per collection (traffic `2.0`) | 2.0 catches brief events (a light changing, a car cutting in); 1.0 halves embed time |
+| `VS_CAPTION_STYLE` | per collection (traffic `driving`) | which caption prompt (`caption.PROMPTS`) |
 | `VS_ARCHIVE_TITLE` / `VS_ITEM_NOUN` / `VS_ITEM_NOUN_PLURAL` | per collection / noun + `s` | what the frontend calls the archive and one item |
 | `VS_SHOT_DETECTOR` | `content` | `adaptive` tolerates flicker and camera motion but can miss cuts |
-| `VS_SHOT_THRESHOLD` | content 18, adaptive 3.0 | lower = more cuts. 18 is below PySceneDetect's 27 because faded silent prints hide cuts; under ~15 flicker starts reading as cuts. Grayscale prints are detected and scored on brightness only |
+| `VS_SHOT_THRESHOLD` | content 18, adaptive 3.0 | lower = more cuts. 18 is below PySceneDetect's 27 because low-contrast footage hides cuts at 27; under ~15 flicker starts reading as cuts. Grayscale video is detected and scored on brightness only |
 | `VS_WINDOW_SEC` / `VS_WINDOW_STRIDE` | `3` / `1` | moment length and step |
 | `VS_CAPTION_CHUNK_SEC` | `12` | long shots are split into chunks this long |
 | `VS_IMAGE_MODEL` / `VS_IMAGE_PRETRAINED` | `ViT-B-16-SigLIP2` / `webli` | e.g. `ViT-SO400M-14-SigLIP2` for better recall (needs a GPU). Re-ingest after changing |
@@ -345,10 +338,10 @@ vidsearch/
   ingest.py    shots, frames, atlases, frame + window embeddings
   caption.py   optional VLM captions + caption embeddings
   embed.py     SigLIP 2 (open_clip) and sentence-transformer wrappers
-  library.py   loads all films, exact numpy search, fused search, heatmap
+  library.py   loads all clips, exact numpy search, fused search, heatmap
   server.py    FastAPI app
   __main__.py  CLI
-tests/test_pipeline.py, tests/test_uploads.py
+tests/test_pipeline.py, tests/test_uploads.py, tests/test_collections.py
 modal_app.py   Modal deployment: web class, GPU job function, admin add_film
 web/           frontend (see web/README.md)
 ```

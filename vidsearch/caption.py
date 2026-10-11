@@ -1,6 +1,6 @@
 """Optional caption layer: a vision LLM describes each shot chunk, then captions are embedded
-with a sentence-transformer. This is what makes action queries ("being chased", "falls off a
-ladder") work, since a single frame embedding can't see motion.
+with a sentence-transformer. This is what makes action queries ("running a red light", "cyclist
+crossing at night") work, since a single frame embedding can't see motion.
 
 Talks to any OpenAI-compatible /chat/completions endpoint that accepts image_url parts:
 OpenAI, Gemini (https://generativelanguage.googleapis.com/v1beta/openai), OpenRouter,
@@ -32,12 +32,6 @@ from .ingest import Log, Progress, frame_path, frame_ranges, no_progress
 
 # Keyed by Settings.caption_style (VS_CAPTION_STYLE).
 PROMPTS = {
-    "film": (
-        "These are {n} frames, in order, from one continuous shot of a film. "
-        "In one or two plain sentences, describe what happens: who is visible, what they are doing, "
-        "the setting, and any movement or action (running, falling, chasing, fighting, etc.). "
-        "Be concrete and visual. Do not guess character or actor names. Do not mention 'frames'."
-    ),
     "driving": (
         "These are {n} frames, in order, from one continuous clip of road or traffic footage. "
         "In one or two plain sentences, describe what happens: the vehicles (type, colour) and what they do "

@@ -1,5 +1,5 @@
-"""Collections: one codebase, several archives. Per-collection defaults, Modal names, caption prompts, the
-archive identity the API hands the frontend, and a 2 fps (traffic) ingest whose times stay in seconds."""
+"""Collections: the traffic archive is the default and the only one. Its defaults, Modal names, caption prompt, the
+archive identity the API hands the frontend, and a 2 fps ingest whose times stay in seconds."""
 
 import base64
 import json
@@ -23,17 +23,6 @@ from vidsearch.server import create_app
 
 ROOT = Path(__file__).parent.parent
 
-FILM_PROMPT_BEFORE_COLLECTIONS = (
-    "These are {n} frames, in order, from one continuous shot of a film. "
-    "In one or two plain sentences, describe what happens: who is visible, what they are doing, "
-    "the setting, and any movement or action (running, falling, chasing, fighting, etc.). "
-    "Be concrete and visual. Do not guess character or actor names. Do not mention 'frames'."
-)
-
-
-KEATON_QUERY_TEMPLATES_BEFORE_COLLECTIONS = ("{}", "a film still of {}", "a black and white movie scene of {}")
-
-
 @pytest.fixture
 def no_collection_env(monkeypatch):
     for k in ["VIDSEARCH_COLLECTION", "VS_SAMPLE_FPS", "VS_CAPTION_STYLE", "VS_ARCHIVE_TITLE", "VS_ITEM_NOUN",
@@ -48,48 +37,46 @@ def identity(s):
 
 def test_settings_follow_the_collection(no_collection_env):
     env = no_collection_env
-    assert identity(Settings()) == ("The Keaton Archive", "film", "films", "film", 1.0)
-    env.setenv("VIDSEARCH_COLLECTION", "keaton")
-    assert identity(Settings()) == ("The Keaton Archive", "film", "films", "film", 1.0)
-    env.setenv("VIDSEARCH_COLLECTION", "traffic")
-    assert identity(Settings()) == ("The Traffic Archive", "clip", "clips", "driving", 2.0)
+    traffic = ("The Traffic Archive", "clip", "clips", "driving", 2.0)
+    assert identity(Settings()) == traffic
+    for name in ["", "traffic"]:
+        env.setenv("VIDSEARCH_COLLECTION", name)
+        assert identity(Settings()) == traffic
     env.setenv("VS_SAMPLE_FPS", "3")
     env.setenv("VS_ITEM_NOUN", "video")
     assert identity(Settings()) == ("The Traffic Archive", "video", "videos", "driving", 3.0)
-    env.setenv("VIDSEARCH_COLLECTION", "trafic")
-    with pytest.raises(ValueError, match="unknown VIDSEARCH_COLLECTION 'trafic'"):
-        Settings()
+    for name in ["trafic", "keaton"]:
+        env.setenv("VIDSEARCH_COLLECTION", name)
+        with pytest.raises(ValueError, match=f"unknown VIDSEARCH_COLLECTION '{name}'"):
+            Settings()
 
 
-def modal_names(collection):
+def modal_app(collection):
+    """modal_app imported in a fresh interpreter with VIDSEARCH_COLLECTION as given (None = unset)."""
     env = {k: v for k, v in os.environ.items() if k != "VIDSEARCH_COLLECTION"}
     if collection is not None:
         env["VIDSEARCH_COLLECTION"] = collection
     code = "import json, modal_app as m; print(json.dumps([m.app.name, m.volume.name, m.jobs_dict.name, m.WEB_LABEL]))"
-    out = subprocess.run([sys.executable, "-W", "ignore", "-c", code], cwd=ROOT, env=env, capture_output=True, text=True)
+    return subprocess.run([sys.executable, "-W", "ignore", "-c", code], cwd=ROOT, env=env, capture_output=True, text=True)
+
+
+def modal_names(collection):
+    out = modal_app(collection)
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-def test_modal_names_per_collection():
+def test_a_plain_deploy_uses_the_live_traffic_names():
     pytest.importorskip("modal")
-    keaton = ["vidsearch", "vidsearch", "vidsearch-jobs", "vidsearch-web"]
-    assert modal_names(None) == keaton
-    assert modal_names("") == keaton
-    assert modal_names("keaton") == keaton
-    assert modal_names("traffic") == ["vidsearch-traffic", "vidsearch-traffic", "vidsearch-traffic-jobs",
-                                      "vidsearch-traffic-web"]
+    live = ["vidsearch-traffic", "vidsearch-traffic", "vidsearch-traffic-jobs", "vidsearch-traffic-web"]
+    for collection in [None, "", "traffic"]:
+        assert modal_names(collection) == live, collection
+    unknown = modal_app("keaton")
+    assert unknown.returncode != 0 and "unknown VIDSEARCH_COLLECTION 'keaton'" in unknown.stderr
 
 
-def test_film_prompt_unchanged():
-    assert PROMPTS["film"] == FILM_PROMPT_BEFORE_COLLECTIONS
-
-
-def test_query_templates_follow_the_collection(no_collection_env):
-    assert Settings().query_templates == KEATON_QUERY_TEMPLATES_BEFORE_COLLECTIONS
-    no_collection_env.setenv("VIDSEARCH_COLLECTION", "traffic")
-    traffic = Settings().query_templates
-    assert traffic[0] == "{}" and not any("film" in q or "black and white" in q for q in traffic)
+def test_query_templates_are_the_collections(no_collection_env):
+    assert Settings().query_templates == ("{}", "a dashcam photo of {}", "a traffic camera image of {}")
 
 
 def test_query_vector_averages_the_given_templates():
@@ -115,33 +102,31 @@ class FakeResponse:
         return {"choices": [{"message": {"content": "A red car turns left."}}]}
 
 
-@pytest.mark.parametrize("style", ["film", "driving"])
-def test_captioner_sends_the_configured_prompt(style, tmp_path):
+def test_captioner_sends_the_configured_prompt(tmp_path):
     from PIL import Image
 
     frame = tmp_path / "000000.jpg"
     Image.new("RGB", (64, 48), (200, 0, 0)).save(frame)
-    s = replace(Settings(), caption_style=style, caption_base_url="http://127.0.0.1:9/v1", caption_model="vlm")
+    s = replace(Settings(), caption_style="driving", caption_base_url="http://127.0.0.1:9/v1", caption_model="vlm")
     c = Captioner(s)
     sent = []
     c.client.post = lambda url, json: sent.append(json) or FakeResponse()
     assert c.caption([frame, frame]) == "A red car turns left."
     text = sent[0]["messages"][0]["content"][0]["text"]
-    assert text == PROMPTS[style].format(n=2)
-    assert ("traffic footage" in text) == (style == "driving")
+    assert text == PROMPTS["driving"].format(n=2) and "traffic footage" in text
 
 
 def test_unknown_caption_style_is_refused():
-    with pytest.raises(ValueError, match="unknown VS_CAPTION_STYLE 'news'"):
-        Captioner(replace(Settings(), caption_style="news", caption_base_url="http://127.0.0.1:9/v1"))
+    for style in ["news", "film"]:
+        with pytest.raises(ValueError, match=f"unknown VS_CAPTION_STYLE '{style}'"):
+            Captioner(replace(Settings(), caption_style=style, caption_base_url="http://127.0.0.1:9/v1"))
 
 
 @pytest.fixture(scope="module")
 def traffic(tmp_path_factory):
-    """A 16 s clip (blue 4 s, red 3 s, green 9 s) ingested and captioned with the traffic collection's settings."""
+    """A 16 s clip (blue 4 s, red 3 s, green 9 s) ingested and captioned with the default (traffic) settings."""
     mp = pytest.MonkeyPatch()
-    mp.setenv("VIDSEARCH_COLLECTION", "traffic")
-    for k in ["VS_SAMPLE_FPS", "VS_CAPTION_STYLE", "VS_ARCHIVE_TITLE", "VS_ITEM_NOUN", "VS_ITEM_NOUN_PLURAL"]:
+    for k in ["VIDSEARCH_COLLECTION", "VS_SAMPLE_FPS", "VS_CAPTION_STYLE", "VS_ARCHIVE_TITLE", "VS_ITEM_NOUN", "VS_ITEM_NOUN_PLURAL"]:
         mp.delenv(k, raising=False)
     s = Settings()
     mp.undo()
@@ -181,7 +166,7 @@ def test_two_fps_search_answers_in_seconds(traffic):
     assert top["t"] == top["frame"] / 2 and 8 <= top["frame"] < 14
     assert top["end"] - top["start"] == 3.0
     assert top["frame_url"] == f"/media/junction/frames/{top['frame']:06d}.jpg"
-    assert "chased" in r[0]["caption"]
+    assert "cyclist" in r[0]["caption"]
     heat = np.frombuffer(base64.b64decode(traffic.heatmap("red")["films"]["junction"]), np.uint8)
     assert len(heat) == 32 and heat[8:14].min() > 200 and heat[:8].max() < 50
 
@@ -200,7 +185,7 @@ def test_library_queries_with_its_collections_templates(traffic):
 
 
 def test_api_names_the_archive(traffic, tmp_path):
-    (tmp_path / "index.html").write_text("<html><head><title>The Keaton Archive</title></head></html>")
+    (tmp_path / "index.html").write_text("<html><head><title>A Build Title</title></head></html>")
     s = replace(traffic.s, web_dist=str(tmp_path))
     with TestClient(create_app(lib=traffic, s=s)) as c:
         body = c.get("/api/library").json()

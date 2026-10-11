@@ -1,6 +1,6 @@
 """Settings, read from environment variables (VS_*) with sensible defaults.
 
-VIDSEARCH_COLLECTION picks which archive's defaults apply (COLLECTIONS); empty means Keaton."""
+VIDSEARCH_COLLECTION picks which archive's defaults apply (COLLECTIONS); empty means traffic."""
 
 from __future__ import annotations
 
@@ -24,11 +24,8 @@ class Collection:
     query_templates: tuple[str, ...]
 
 
-DEFAULT_COLLECTION = "keaton"
+DEFAULT_COLLECTION = "traffic"
 COLLECTIONS = {
-    # "film still" phrasings help on old black-and-white footage.
-    "keaton": Collection(title="The Keaton Archive", noun="film", caption_style="film", sample_fps=1.0,
-                         query_templates=("{}", "a film still of {}", "a black and white movie scene of {}")),
     "traffic": Collection(title="The Traffic Archive", noun="clip", caption_style="driving", sample_fps=2.0,
                           query_templates=("{}", "a dashcam photo of {}", "a traffic camera image of {}")),
 }
@@ -75,7 +72,7 @@ class Settings:
 
     # Captions are generated per shot chunk; long shots are split into chunks
     caption_chunk_sec: float = field(default_factory=lambda: float(_env("VS_CAPTION_CHUNK_SEC", "12")))
-    # Which prompt describes a chunk (caption.PROMPTS): "film" or "driving".
+    # Which prompt describes a chunk (caption.PROMPTS).
     caption_style: str = field(default_factory=lambda: _env("VS_CAPTION_STYLE", _collection().caption_style))
 
     # What the frontend calls the archive and its items (masthead, tab title, stats line, upload copy).

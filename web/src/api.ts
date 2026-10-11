@@ -234,7 +234,7 @@ export interface Identity { title: string; noun: string; nounPlural: string }
  * Until the API answers: this build's VITE_ARCHIVE_TITLE, else the page's own title, which the API rewrites to its
  * archive's when it serves the page. Also the identity of an API from before `archive` existed.
  */
-export const FALLBACK_IDENTITY: Identity = { title: String(import.meta.env.VITE_ARCHIVE_TITLE || document.title), noun: 'film', nounPlural: 'films' }
+export const FALLBACK_IDENTITY: Identity = { title: String(import.meta.env.VITE_ARCHIVE_TITLE || document.title), noun: 'clip', nounPlural: 'clips' }
 
 export interface Archive { films: Film[]; uploads: UploadsMode; identity: Identity }
 

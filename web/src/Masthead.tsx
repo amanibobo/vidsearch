@@ -1,6 +1,6 @@
 import type { Film, Identity } from './api'
 
-/** `8 films · 2 h 46 min · 9,951 frames`: item count, total running time, total sampled frames. */
+/** `8 clips · 2 h 46 min · 9,951 frames`: item count, total running time, total sampled frames. */
 export function archiveStats(films: readonly Film[], identity: Identity): string {
   const minutes = Math.round(films.reduce((s, f) => s + f.duration, 0) / 60)
   const h = Math.floor(minutes / 60), m = minutes % 60

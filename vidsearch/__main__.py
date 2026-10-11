@@ -2,7 +2,7 @@
 
     ingest  VIDEO_OR_DIR...   shots, frames, atlases, embeddings
     caption [--film ID]       optional VLM captions for action-level search
-    search  "being chased"    query from the terminal
+    search  "a cyclist"       query from the terminal
     list                      show ingested films
     serve                     start the API
 """

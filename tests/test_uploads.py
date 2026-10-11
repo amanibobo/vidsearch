@@ -73,6 +73,7 @@ def env(tmp_path_factory):
     s = Settings()
     s.data_dir = root / "data"
     s.videos_dir = root / "videos"
+    s.sample_fps = 1.0  # one frame per second keeps the frame counts below easy to read
     s.shot_threshold = "27"
     s.auth0_domain = DOMAIN
     s.auth0_audience = AUDIENCE

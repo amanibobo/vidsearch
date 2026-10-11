@@ -1,6 +1,6 @@
 // Drives the running dev server in headless Chromium at 1920x1080: screenshots, the archive title and loaders (slow,
 // failing and cold API; atlas progress), atlas pixel checks on plane slices and lifted cards, hover-card placement, frame
-// still and video seek, search states and retries, camera travel, fps, and the overview at a 3-film library. Then
+// still and video seek, search states and retries, camera travel, fps, and the overview at a library of up to 3 films. Then
 // uploads, in whichever mode the API advertises: quota, client-side refusals, a chunked upload with an injected part
 // failure, job stages and overall progress, the new private strip and camera moves, search and privacy across
 // identities, URL errors, the panel's tabs and motion (and reduced motion), my uploads rows, delete, the empty state.
@@ -8,11 +8,11 @@
 // rows, cancel giving the slot back and the per-IP cap; account mode (VS_DEV_AUTH=1 and VITE_DEV_AUTH=tester) adds sign-in and expired sessions.
 // Usage: node scripts/verify.mjs <outDir> <label>   (env BASE_URL, default http://localhost:5199; CHROMIUM to override the binary;
 // ONLY=archive or ONLY=uploads runs one half; ONLY=prod checks a production build served by `vite preview` instead;
-// ONLY=collection checks any collection's API (not just Keaton's films): its title, nouns, upload copy and hover seek on
-// every film sampled at other than 1 fps; SERVED_PAGE=<the API's own URL, run with VS_WEB_DIST> adds the title it serves).
-// Title, nouns and stats are checked against the API's `archive` in /api/library.
-// The upload half makes its 30 s clip from ../videos/Cops.mp4 with ffmpeg and fills the API's per-IP quota, so give it
-// a freshly started API (job records and counts live in its memory).
+// ONLY=collection checks the API's collection: its title, nouns, upload copy and hover seek on every film sampled at
+// other than 1 fps; SERVED_PAGE=<the API's own URL, run with VS_WEB_DIST> adds the title it serves).
+// Everything archive-specific comes from /api/library: title, nouns and stats from its `archive`, the atlas checks from
+// its first film, and the upload clip from that film's video (with ffmpeg). Any archive works, given at least two films.
+// The upload half fills the API's per-IP quota, so give it a freshly started API (job records and counts live in its memory).
 import { chromium } from 'playwright-core'
 import { spawnSync } from 'node:child_process'
 import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, statSync, writeFileSync } from 'node:fs'
@@ -23,17 +23,18 @@ const [outDir = '.', label = 'run'] = process.argv.slice(2)
 mkdirSync(outDir, { recursive: true })
 const BASE = process.env.BASE_URL ?? 'http://localhost:5199'
 const VIEWPORT = { width: 1920, height: 1080 }
-const ATLAS_FILM = 'one-week'
-const ATLAS_FRAMES = [0, 700, 1335, 1336]
 const CARD_ATLAS_RANKS = [0, 1, 2]
 const INPUT = 'input[aria-label="Search"]'
-const IDENTITY = (await (await fetch(new URL('/api/library', BASE))).json()).archive
+const LIBRARY = await (await fetch(new URL('/api/library', BASE))).json()
+const IDENTITY = LIBRARY.archive
+// Plain words any footage answers to with some ranking; the second also lifts a full set of cards.
+const QUERY = 'a car'
+const CARDS_QUERY = 'a road at night'
 const WAITING_PLACEHOLDER = 'waiting for the archive…'
 const ONLY = process.env.ONLY ?? ''
 const DEV_USER = 'tester'
 const DEVICE_NOTE = 'uploads are tied to this browser; clearing site data loses access'
 const DEVICE_TOKEN = /^device:[0-9a-f]{32}$/
-const SOURCE_FILM = new URL('../../videos/Cops.mp4', import.meta.url).pathname
 const POLL = 1500
 
 /** Records every loader line (with whether the strips were showing) and every frame-still show/hide in the hover card. */
@@ -222,6 +223,10 @@ async function archiveChecks() {
   console.log('webgl renderer:', renderer)
   const library = await page.evaluate(async () => (await (await fetch('/api/library')).json()).films)
   console.log('films:', library.map((f) => `${f.id} (${f.n_frames})`).join(', '))
+  // The first film's first frames, its middle, and the two frames either side of its first atlas page break (or its end).
+  const atlasFilm = library[0].id
+  const edge = Math.min(library[0].atlas.per_page, library[0].n_frames - 1)
+  const atlasFrames = [0, Math.floor(edge / 2), edge - 1, edge]
   await page.waitForTimeout(2500)
   await shot(page, '2-overview')
 
@@ -252,19 +257,19 @@ async function archiveChecks() {
   check(ends.every((e) => inView(e.first) && inView(e.last)), `overview shows every film's first and last frame above the search pill (pill top ${pill.y.toFixed(0)})`)
   const nearY = ends.map((e) => e.first.y)
   check(Math.max(...nearY) - Math.min(...nearY) < 2, `near ends (frame 0) line up: screen y ${nearY.map((y) => y.toFixed(1)).join(', ')}`)
-  const perColumn = await page.evaluate((id) => { const a = window.__vidsearch.screenOf(id, 0), b = window.__vidsearch.screenOf(id, 1); return { a, b } }, ATLAS_FILM)
+  const perColumn = await page.evaluate((id) => { const a = window.__vidsearch.screenOf(id, 0), b = window.__vidsearch.screenOf(id, 1); return { a, b } }, atlasFilm)
   check(perColumn.b.y < perColumn.a.y, `time runs away from the viewer: frame 1 is above frame 0 on screen (${perColumn.b.y.toFixed(1)} < ${perColumn.a.y.toFixed(1)})`)
   const idleTone = await tone(page, { x: 0, y: 150, width: VIEWPORT.width, height: pill.y - 160 })
 
   if (process.env.ATLAS !== '0') {
-    const nFrames = library.find((f) => f.id === ATLAS_FILM).n_frames
-    for (const frame of ATLAS_FRAMES) {
-      await page.evaluate(([id, f]) => window.__vidsearch.focusFrame(id, f, 1400), [ATLAS_FILM, frame])
+    const nFrames = library[0].n_frames
+    for (const frame of atlasFrames) {
+      await page.evaluate(([id, f]) => window.__vidsearch.focusFrame(id, f, 1400), [atlasFilm, frame])
       await settle()
       const inset = 0.1, cols = 96, rows = 12
-      const { band, points } = await page.evaluate(([id, f, c, r, i]) => window.__vidsearch.sliceGrid(id, f, c, r, i), [ATLAS_FILM, frame, cols, rows, inset])
-      const result = await compareRegion(page, { film: ATLAS_FILM, frame, nFrames, points, cols, rows, band: [0.5 - band / 2 + inset * band, band * (1 - 2 * inset)] })
-      atlasVerdict(`slice ${ATLAS_FILM}`, frame, result, `atlas-slice-${frame}`)
+      const { band, points } = await page.evaluate(([id, f, c, r, i]) => window.__vidsearch.sliceGrid(id, f, c, r, i), [atlasFilm, frame, cols, rows, inset])
+      const result = await compareRegion(page, { film: atlasFilm, frame, nFrames, points, cols, rows, band: [0.5 - band / 2 + inset * band, band * (1 - 2 * inset)] })
+      atlasVerdict(`slice ${atlasFilm}`, frame, result, `atlas-slice-${frame}`)
     }
     await page.evaluate(() => window.__vidsearch.showOverview())
     await settle()
@@ -276,10 +281,13 @@ async function archiveChecks() {
   await page.mouse.up()
   const afterDrag = await view()
   check(afterDrag.y > overview.y + 0.5, `dragging the plane down moves forward in time (focus y ${overview.y.toFixed(2)} -> ${afterDrag.y.toFixed(2)})`)
+  // Back to the overview first: on a short plane the drag alone reaches its far end.
+  await page.evaluate(() => window.__vidsearch.showOverview())
+  await settle()
   await page.mouse.wheel(0, 300)
   await settle()
   const afterWheel = await view()
-  check(afterWheel.y > afterDrag.y + 1, `wheel pans forward in time (focus y ${afterDrag.y.toFixed(2)} -> ${afterWheel.y.toFixed(2)})`)
+  check(afterWheel.y > overview.y + 1, `wheel pans forward in time (focus y ${overview.y.toFixed(2)} -> ${afterWheel.y.toFixed(2)})`)
   await page.keyboard.down('Control')
   await page.mouse.wheel(0, -100)
   await page.keyboard.up('Control')
@@ -301,7 +309,7 @@ async function archiveChecks() {
 
   let failedCalls = 0
   await page.route('**/api/search**', (r) => { failedCalls++; return r.fulfill({ status: 500, body: 'boom' }) })
-  await page.fill(INPUT, 'a train')
+  await page.fill(INPUT, QUERY)
   await page.press(INPUT, 'Enter')
   await page.waitForTimeout(2500)
   const waking = await page.textContent('.pill-status')
@@ -313,7 +321,7 @@ async function archiveChecks() {
 
   let coldCalls = 0
   await page.route('**/api/search**', (r) => (++coldCalls === 1 ? r.fulfill({ status: 503, body: 'cold' }) : r.continue()))
-  const coldStatus = await searchFor('a train')
+  const coldStatus = await searchFor(QUERY)
   check(/^\d+$/.test(coldStatus) && coldCalls === 2, `a search whose first attempt gets 503 retries and succeeds: "${coldStatus}" after ${coldCalls} requests`)
   await page.unroute('**/api/search**')
 
@@ -321,34 +329,37 @@ async function archiveChecks() {
   await page.fill(INPUT, 'a dog')
   await page.press(INPUT, 'Enter')
   check(await page.isVisible('.pill .spinner'), 'loading shows a spinner inside the pill')
-  const trainCount = await searchFor('a train')
-  const trainTop = await page.evaluate(async () => (await (await fetch('/api/search?q=a%20train')).json()).results[0])
+  const queryCount = await searchFor(QUERY)
+  const queryTop = await page.evaluate(async (q) => (await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json()).results[0], QUERY)
   await page.keyboard.press('ArrowDown')
   await page.waitForSelector('.card-label')
-  const trainLabel = await page.textContent('.card-label')
+  const queryLabel = await page.textContent('.card-label')
   await page.waitForTimeout(3500)
   await page.unroute('**/api/search?q=a%20dog*')
   const later = { label: await page.textContent('.card-label').catch(() => null), count: await statusText() }
-  check(later.label === trainLabel && trainLabel === `${trainTop.title} · ${clock(trainTop.start)}` && later.count === `1/${trainCount}`,
-    `slow superseded "a dog" search ignored: card stays "${later.label}", count "${later.count}" (a train top: ${trainTop.title} · ${clock(trainTop.start)})`)
-  check(/^\d+$/.test(trainCount), `search "a train" shows its result count in the pill: "${trainCount}"`)
+  check(later.label === queryLabel && queryLabel === `${queryTop.title} · ${clock(queryTop.start)}` && later.count === `1/${queryCount}`,
+    `slow superseded "a dog" search ignored: card stays "${later.label}", count "${later.count}" (${QUERY} top: ${queryTop.title} · ${clock(queryTop.start)})`)
+  check(/^\d+$/.test(queryCount), `search "${QUERY}" shows its result count in the pill: "${queryCount}"`)
   await page.mouse.move(5, 5)
   await page.mouse.move(8, 8)
   await page.waitForSelector('.hover', { state: 'detached' })
-  await shot(page, '5-a-train')
+  await shot(page, '5-query')
+  // ArrowDown flew to the top result if it sat near the overview's edge.
+  await page.evaluate(() => window.__vidsearch.showOverview())
+  await settle()
 
-  const chasedCount = await searchFor('being chased')
-  const results = await page.evaluate(async () => (await (await fetch('/api/search?q=being%20chased')).json()).results)
-  check(chasedCount === String(results.length), `search "being chased" count in pill: "${chasedCount}" of ${results.length}`)
+  const cardsCount = await searchFor(CARDS_QUERY)
+  const results = await page.evaluate(async (q) => (await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json()).results, CARDS_QUERY)
+  check(cardsCount === String(results.length), `search "${CARDS_QUERY}" count in pill: "${cardsCount}" of ${results.length}`)
   await page.waitForFunction(() => window.__vidsearch.card(0)?.opacity === 1, null, { timeout: 5000 })
   await page.waitForTimeout(1200)
-  await shot(page, '4-being-chased')
+  await shot(page, '4-cards')
   const cards = await page.evaluate((n) => Array.from({ length: n }, (_, r) => window.__vidsearch.card(r)), results.length)
   const lifted = cards.filter(Boolean)
   check(lifted.length >= Math.min(results.length, 10) && lifted.every((c) => c.box), `top results lifted as cards on screen: ${lifted.length} of ${results.length}`)
-  const chasedTone = await tone(page, { x: 0, y: 150, width: VIEWPORT.width, height: pill.y - 160 })
-  check(chasedTone.lum < idleTone.lum * 0.45 && chasedTone.lilac > idleTone.lilac + 2000,
-    `results dim the archive (mean luma ${idleTone.lum} -> ${chasedTone.lum}) and show lilac heat (${idleTone.lilac} -> ${chasedTone.lilac} lilac px)`)
+  const resultsTone = await tone(page, { x: 0, y: 150, width: VIEWPORT.width, height: pill.y - 160 })
+  check(resultsTone.lum < idleTone.lum * 0.45 && resultsTone.lilac > idleTone.lilac + 2000,
+    `results dim the archive (mean luma ${idleTone.lum} -> ${resultsTone.lum}) and show lilac heat (${idleTone.lilac} -> ${resultsTone.lilac} lilac px)`)
   const view0 = await view()
   check(Math.abs(view0.y - overview.y) < 1e-6 && Math.abs(view0.dist - overview.dist) < 1e-6, 'camera stays at the overview after a search')
 
@@ -536,7 +547,7 @@ async function archiveChecks() {
   await broken.close()
 
   const page3 = await browser.newPage({ viewport: VIEWPORT })
-  page3.on('pageerror', (e) => failures.push(`pageerror (3 films): ${e.message}`))
+  page3.on('pageerror', (e) => failures.push(`pageerror (up to 3 films): ${e.message}`))
   await page3.route('**/api/library', async (r) => {
     const body = await (await r.fetch()).json()
     await r.fulfill({ json: { ...body, films: body.films.slice(0, 3) } })
@@ -545,24 +556,31 @@ async function archiveChecks() {
   await page3.waitForFunction(() => window.__vidsearch?.settled())
   await ready(page3)
   await page3.waitForTimeout(2500)
-  await shot(page3, '6-overview-3-films')
+  await shot(page3, '6-overview-small')
   const pill3 = await page3.locator('form.pill').boundingBox()
   const films3 = await page3.evaluate(async () => (await (await fetch('/api/library')).json()).films)
   const ends3 = await page3.evaluate((films) => films.map((f) => [window.__vidsearch.screenOf(f.id, 0), window.__vidsearch.screenOf(f.id, f.n_frames - 1)]), films3)
   const inView3 = (p) => p && p.x > 0 && p.x < VIEWPORT.width && p.y > 0 && p.y < pill3.y
-  check(films3.length === 3 && ends3.flat().every(inView3), `3-film library (first 3 films) fits the overview above the pill`)
+  check(films3.length === Math.min(3, library.length) && ends3.flat().every(inView3), `${films3.length}-film library (the first films) fits the overview above the pill`)
   const near3 = await page3.evaluate((films) => films.map((f) => window.__vidsearch.screenOf(f.id, 20)), films3)
   const lum3 = []
   for (const p of near3) lum3.push((await tone(page3, { x: p.x - 12, y: p.y - 8, width: 24, height: 16 })).lum)
-  check(lum3.every((l) => l > 15), `every film in the 3-film library draws (luma near frame 20: ${lum3.join(', ')}; background ~5)`)
+  check(lum3.every((l) => l > 15), `every film in the ${films3.length}-film library draws (luma near frame 20: ${lum3.join(', ')}; background ~5)`)
 }
 
-/** A 30 s clip re-encoded at 6 Mbit/s, so it is three 8 MiB parts, and a sparse file just over the 2 GB limit. */
-function uploadFixtures() {
+/**
+ * 30 s of the library's first video (looped if shorter) re-encoded at a constant 6 Mbit/s, so it is three 8 MiB parts,
+ * and a sparse file just over the 2 GB limit.
+ */
+async function uploadFixtures() {
   const clip = join(outDir, 'upload-clip.mp4')
   if (!existsSync(clip)) {
-    const r = spawnSync('ffmpeg', ['-y', '-loglevel', 'error', '-ss', '600', '-t', '30', '-i', SOURCE_FILM, '-c:v', 'libx264', '-preset', 'veryfast',
-      '-b:v', '6M', '-maxrate', '6M', '-bufsize', '12M', '-c:a', 'aac', clip], { stdio: 'inherit' })
+    const source = join(outDir, 'upload-source')
+    const video = await fetch(new URL(LIBRARY.films[0].video_url, BASE))
+    if (!video.ok) throw new Error(`GET ${LIBRARY.films[0].video_url}: HTTP ${video.status}`)
+    writeFileSync(source, Buffer.from(await video.arrayBuffer()))
+    const r = spawnSync('ffmpeg', ['-y', '-loglevel', 'error', '-stream_loop', '-1', '-i', source, '-t', '30', '-an', '-c:v', 'libx264', '-preset', 'veryfast',
+      '-b:v', '6M', '-minrate', '6M', '-maxrate', '6M', '-bufsize', '12M', '-x264-params', 'nal-hrd=cbr', clip], { stdio: 'inherit' })
     if (r.status !== 0) throw new Error(`ffmpeg failed making ${clip}`)
   }
   const oversize = join(outDir, 'upload-oversize.mp4')
@@ -658,7 +676,7 @@ async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
   const autoTitle = { value: await page.inputValue('input[name=title]'), placeholder: await page.getAttribute('input[name=title]', 'placeholder') }
   check(autoTitle.value === '' && autoTitle.placeholder === 'upload-clip' && !(await page.$('.upload-error')) && !(await page.isDisabled('.upload-submit')),
     `choosing the clip clears the refusal, enables upload and offers its file name as the default title ("${autoTitle.placeholder}")`)
-  const title = `Cops clip ${run}`
+  const title = `upload clip ${run}`
   await page.fill('input[name=title]', title)
   const viewBefore = await page.evaluate(() => window.__vidsearch.view())
   await page.evaluate(() => {
@@ -760,7 +778,8 @@ async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
     await page.waitForFunction(() => window.__vidsearch.settled(), null, { timeout: 15000 })
     await page.waitForTimeout(400)
     const after = await page.evaluate(() => window.__vidsearch.view())
-    const mid = await page.evaluate(([id, n]) => window.__vidsearch.screenOf(id, Math.floor(n / 2)), [filmId, 30])
+    const n = (await apiAs(page, me.bearer, '/api/library')).body.films.find((f) => f.id === filmId)?.n_frames ?? 0
+    const mid = await page.evaluate(([id, n]) => window.__vidsearch.screenOf(id, Math.floor(n / 2)), [filmId, n])
     check(closing && after.dist < before.dist * 0.6 && !!mid && Math.abs(mid.x - VIEWPORT.width / 2) < 120 && Math.abs(mid.y - VIEWPORT.height / 2) < 160,
       `${what} fades the panel out and eases the camera to the strip (dist ${before.dist.toFixed(1)} -> ${after.dist.toFixed(1)}; strip middle at ${mid && `${mid.x.toFixed(0)},${mid.y.toFixed(0)}`})`)
   }
@@ -775,8 +794,8 @@ async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
   const others = await page.evaluate((ids) => ids.map((id) => window.__vidsearch.ownerMark(id)), lib.filter((f) => !f.owner_is_you).map((f) => f.id))
   check(others.every((m) => m === null), 'public films carry no ownership mark')
 
-  const probe = (await apiAs(page, me.bearer, `/api/search?q=${encodeURIComponent('a man')}&k=3&films=${filmId}`)).body.results
-  const query = probe[0]?.caption ?? 'a man'
+  const probe = (await apiAs(page, me.bearer, `/api/search?q=${encodeURIComponent(QUERY)}&k=3&films=${filmId}`)).body.results
+  const query = probe[0]?.caption ?? QUERY
   console.log(`searching for a moment of the clip: "${query}"`)
   const found = await uiSearch(page, query)
   const hit = found.body.results.find((r) => r.film_id === filmId)
@@ -877,8 +896,9 @@ async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
   check(confirm === 'delete?yes·no' && kept, `delete asks inline first ("${confirm}": "delete?", "yes", "·", "no"); "no" keeps the row and sends nothing`)
   await page.waitForFunction((id) => !window.__vidsearch.screenOf(id, 0), filmId, { timeout: 15000 }).catch(() => {})
   const libAfter = (await apiAs(page, me.bearer, '/api/library')).body.films
-  check(leaving && deletes === 1 && !libAfter.some((f) => f.id === filmId) && !(await page.evaluate((id) => window.__vidsearch.screenOf(id, 0), filmId)),
-    'confirming deletes the film from the API library and its strip from the plane, and the row collapses away')
+  const gone = { leaving, deletes, inLibrary: libAfter.some((f) => f.id === filmId), onPlane: !!(await page.evaluate((id) => window.__vidsearch.screenOf(id, 0), filmId)) }
+  check(gone.leaving && gone.deletes === 1 && !gone.inLibrary && !gone.onPlane,
+    `confirming deletes the film from the API library and its strip from the plane, and the row collapses away (${JSON.stringify(gone)})`)
 
   await page.waitForSelector('.mine-empty', { timeout: 10000 }).catch(() => {})
   const empty = await page.textContent('.mine-empty p').catch(() => null)
@@ -894,7 +914,7 @@ async function uploadJourney(page, me, openOther, { clip, oversize, run }) {
 async function accountChecks() {
   const run = Date.now().toString(36)
   const me = `tester-${run}`, other = `other-${run}`
-  const fixtures = { ...uploadFixtures(), run }
+  const fixtures = { ...(await uploadFixtures()), run }
   const contexts = []
   const menu = async (page, item) => {
     if (!(await page.$('.menu'))) await page.click('.account-avatar')
@@ -930,7 +950,7 @@ async function accountChecks() {
 
 async function deviceChecks() {
   const run = Date.now().toString(36)
-  const fixtures = { ...uploadFixtures(), run }
+  const fixtures = { ...(await uploadFixtures()), run }
   const contexts = []
   const corner = (page, item) => page.click(`.account-bar button:text-is("${item}")`)
   const openPanel = async (page, item) => {

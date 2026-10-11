@@ -65,7 +65,7 @@ class StubCaptioner:
         StubCaptioner.calls += 1
         m = np.asarray(Image.open(frames[0]).convert("RGB")).reshape(-1, 3).mean(0)
         if m[0] > 150 and m[1] < 100:
-            return "A man is being chased down the street by a crowd."
+            return "A cyclist is crossing the street in front of a car."
         if m.min() > 200:
             return "A bright white wall."
         return "A quiet room, people standing still."
@@ -86,11 +86,12 @@ def lib(tmp_path_factory):
     root = tmp_path_factory.mktemp("vs")
     vids = root / "vids"
     vids.mkdir()
-    _make_clip(vids / "Seven_Chances_1925.mp4", [("blue", 6), ("red", 5), ("green", 7), ("blue", 4), ("red", 3)])
-    _make_clip(vids / "sherlock-jr.mp4", [("green", 5), ("white", 6), ("red", 8), ("blue", 5)])
+    _make_clip(vids / "Elm_St_Northbound_2024.mp4", [("blue", 6), ("red", 5), ("green", 7), ("blue", 4), ("red", 3)])
+    _make_clip(vids / "junction-cam.mp4", [("green", 5), ("white", 6), ("red", 8), ("blue", 5)])
 
     s = Settings()
     s.data_dir = root / "data"
+    s.sample_fps = 1.0  # one frame per second keeps the frame counts below easy to read
     # Noisy flat white has random hue, which scores ~22 every frame and swallows real cuts at the
     # default 18; real footage doesn't behave like this, so pin PySceneDetect's stock threshold.
     s.shot_threshold = "27"
@@ -103,8 +104,8 @@ def lib(tmp_path_factory):
 
 
 def test_ingest_artifacts(lib):
-    assert [f.meta["id"] for f in lib.films] == ["seven-chances-1925", "sherlock-jr"]
-    assert lib.films[0].meta["title"] == "Seven Chances 1925"
+    assert [f.meta["id"] for f in lib.films] == ["elm-st-northbound-2024", "junction-cam"]
+    assert lib.films[0].meta["title"] == "Elm St Northbound 2024"
     assert lib.films[0].shots == [[0.0, 6.0], [6.0, 11.0], [11.0, 18.0], [18.0, 22.0], [22.0, 25.0]]
     assert len(lib.F) == 49 and lib.n_captions == 9
 
@@ -117,19 +118,19 @@ def test_caption_resume_skips_done(lib):
 
 def test_visual_search_finds_red_shots(lib):
     r = lib.search("red", k=6)
-    red = {("Seven Chances 1925", 6, 11), ("Seven Chances 1925", 22, 25), ("Sherlock Jr", 11, 19)}
+    red = {("Elm St Northbound 2024", 6, 11), ("Elm St Northbound 2024", 22, 25), ("Junction Cam", 11, 19)}
     for x in r[:3]:
         assert x["similarity"] > 0.99
         assert any(x["title"] == t and a <= x["t"] < b for t, a, b in red), x
 
 
 def test_caption_search_finds_action(lib):
-    r = lib.search("being chased", k=5, use=("caption",))
-    assert all("chased" in x["caption"] for x in r[:3])
+    r = lib.search("cyclist crossing", k=5, use=("caption",))
+    assert all("cyclist" in x["caption"] for x in r[:3])
 
 
 def test_film_filter_and_dedupe(lib):
-    assert all(x["film_id"] == "sherlock-jr" for x in lib.search("blue", k=4, films=["sherlock-jr"]))
+    assert all(x["film_id"] == "junction-cam" for x in lib.search("blue", k=4, films=["junction-cam"]))
     r = lib.search("red", k=50)
     for i, a in enumerate(r):
         for b in r[i + 1:]:
@@ -138,7 +139,7 @@ def test_film_filter_and_dedupe(lib):
 
 
 def test_heatmap(lib):
-    v = np.frombuffer(base64.b64decode(lib.heatmap("red")["films"]["sherlock-jr"]), np.uint8)
+    v = np.frombuffer(base64.b64decode(lib.heatmap("red")["films"]["junction-cam"]), np.uint8)
     assert len(v) == 24 and v[11:19].min() > 200 and v[:5].max() < 50
 
 
@@ -156,7 +157,7 @@ def test_api(lib):
         assert fr.status_code == 200 and fr.headers["content-type"] == "image/jpeg"
         at = c.get(L["films"][0]["atlas"]["urls"][0])
         assert Image.open(io.BytesIO(at.content)).size == (42 * 96, 72)
-        vr = c.get("/api/video/seven-chances-1925", headers={"Range": "bytes=0-99"})
+        vr = c.get("/api/video/elm-st-northbound-2024", headers={"Range": "bytes=0-99"})
         assert vr.status_code == 206 and len(vr.content) == 100
         assert c.get("/api/heatmap", params={"q": "red"}).status_code == 200
         both = c.get("/api/search", params={"q": "red", "heatmap": 1}).json()
@@ -182,12 +183,12 @@ def test_api_serves_frontend_and_runs_reload_hook(lib, tmp_path):
 
     from vidsearch.server import create_app
 
-    (tmp_path / "index.html").write_text("<title>The Keaton Archive</title>")
+    (tmp_path / "index.html").write_text("<title>A Build Title</title>")
     lib.s.web_dist = str(tmp_path)
     calls = []
     try:
         with TestClient(create_app(lib=lib, s=lib.s, before_reload=lambda: calls.append(1))) as c:
-            assert "<title>The Keaton Archive</title>" in c.get("/").text
+            assert "<title>The Traffic Archive</title>" in c.get("/").text
             assert c.get("/api/library").json()["films"]
             assert c.post("/api/reload").json() == {"films": 2} and calls == [1]
     finally:

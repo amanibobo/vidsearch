@@ -1,18 +1,13 @@
 """Run vidsearch on Modal: the library lives on a Volume, the API + frontend are one web endpoint,
-and new films are ingested and captioned on a GPU without touching this machine.
+and new clips are ingested and captioned on a GPU without touching this machine.
 
-    modal deploy modal_app.py                                        # API + app at https://<workspace>--vidsearch-web.modal.run
-    modal run modal_app.py::add_film --url <video url> --name "Cops"  # download, ingest, caption (public)
+    modal deploy modal_app.py                                        # API + app at https://<workspace>--vidsearch-traffic-web.modal.run
+    modal run modal_app.py::add_film --url <video url> --name "Junction at dusk"  # download, ingest, caption (public)
     modal run modal_app.py::relocate_sources                         # after `modal volume put` from a Mac
 
-Each collection (vidsearch.config.COLLECTIONS) is its own deployment with its own names, chosen at deploy time:
-
-    VIDSEARCH_COLLECTION=traffic modal deploy modal_app.py           # app, Volume vidsearch-traffic, label vidsearch-traffic-web,
-                                                                     # Dict vidsearch-traffic-jobs
-    VIDSEARCH_COLLECTION=traffic modal run modal_app.py::add_film --url <video url> --name "..."
-
-Unset (or "keaton") keeps the original names: app and Volume "vidsearch", label "vidsearch-web", Dict "vidsearch-jobs".
-The Volume ("vidsearch", or "vidsearch-<collection>") holds /videos/<name>.mp4 and /data/films/<id>/... exactly as the local layout,
+Names follow the collection (vidsearch.config.COLLECTIONS; VIDSEARCH_COLLECTION, default traffic): app and Volume
+"vidsearch-<collection>", web label "vidsearch-<collection>-web", Dict "vidsearch-<collection>-jobs".
+The Volume holds /videos/<name>.mp4 and /data/films/<id>/... exactly as the local layout,
 plus /data/uploads/<job id>/ for the parts of in-flight browser uploads.
 Captions use the "vidsearch-anthropic" secret (ANTHROPIC_API_KEY, VS_CAPTION_MODEL):
     modal secret create vidsearch-anthropic --from-dotenv .env
@@ -24,7 +19,7 @@ Before relying on the per-IP limit, check what Modal's proxy puts in request.cli
 and set VS_CLIENT_IP_HEADER if the client's address is only in a header (README, "Accounts and uploads").
 
 Uploads: the web container stores parts on the Volume, assembles them, commits, and spawns
-`process_job` on a GPU. Job records live in the "vidsearch-jobs" Dict; the web container reads
+`process_job` on a GPU. Job records live in the jobs Dict; the web container reads
 them to report progress and reloads the library when it sees a finished job.
 """
 
@@ -34,14 +29,14 @@ from pathlib import Path
 
 import modal
 
-from vidsearch.config import DEFAULT_COLLECTION, collection_name
+from vidsearch.config import collection_name
 
 ROOT = Path(__file__).parent
 VOL = "/vol"
 VIDEOS = f"{VOL}/videos"
 
 COLLECTION = collection_name()
-NAME = "vidsearch" if COLLECTION == DEFAULT_COLLECTION else f"vidsearch-{COLLECTION}"
+NAME = f"vidsearch-{COLLECTION}"
 WEB_LABEL = f"{NAME}-web"
 
 volume = modal.Volume.from_name(NAME, create_if_missing=True)

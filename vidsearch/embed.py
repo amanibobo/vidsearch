@@ -71,7 +71,7 @@ class ImageTextEmbedder:
         return _normalize(feats.float().cpu().numpy())
 
     def encode_query(self, query: str, templates: Sequence[str]) -> np.ndarray:
-        """Template-ensembled query vector, shape (dim,). templates: Settings.query_templates, e.g. "a film still of {}"."""
+        """Template-ensembled query vector, shape (dim,). templates: Settings.query_templates, e.g. "a dashcam photo of {}"."""
         vecs = self.encode_texts([t.format(query) for t in templates])
         return _normalize(vecs.mean(axis=0))
 
